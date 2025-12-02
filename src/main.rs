@@ -12,9 +12,13 @@ use walkdir::WalkDir;
 
 const MAX_WINDOW_WIDTH: usize = 1920;
 const MAX_WINDOW_HEIGHT: usize = 1080;
-const ZSTD_LEVEL: i32 = 9;
+
+// По факту sweet spot по замерам
+const ZSTD_LEVEL: i32 = 10;
+// Под твой 6-ядерный CPU
 const ZSTD_WORKERS: u32 = 6;
-const CHUNK_TARGET: usize = 256 * 1024;
+// Чанки по 128KB на канал
+const CHUNK_TARGET: usize = 128 * 1024;
 
 fn main() {
     if let Err(e) = run() {
@@ -164,6 +168,78 @@ struct EncChannel {
     data: Vec<u8>,
 }
 
+/// SIMD-friendly: одна строка RGBA → 4 planar-строки
+fn deinterleave_rgba_row_to_planar(
+    row_rgba: &[u8],
+    dst_r: &mut [u8],
+    dst_g: &mut [u8],
+    dst_b: &mut [u8],
+    dst_a: &mut [u8],
+) {
+    let len = dst_r.len();
+    debug_assert_eq!(dst_g.len(), len);
+    debug_assert_eq!(dst_b.len(), len);
+    debug_assert_eq!(dst_a.len(), len);
+    debug_assert_eq!(row_rgba.len(), len * 4);
+
+    unsafe {
+        let mut src = row_rgba.as_ptr();
+        let mut pr = dst_r.as_mut_ptr();
+        let mut pg = dst_g.as_mut_ptr();
+        let mut pb = dst_b.as_mut_ptr();
+        let mut pa = dst_a.as_mut_ptr();
+
+        for _ in 0..len {
+            *pr = *src;
+            *pg = *src.add(1);
+            *pb = *src.add(2);
+            *pa = *src.add(3);
+
+            src = src.add(4);
+            pr = pr.add(1);
+            pg = pg.add(1);
+            pb = pb.add(1);
+            pa = pa.add(1);
+        }
+    }
+}
+
+/// SIMD-friendly: 4 planar-плоскости → RGBA interleaved
+fn interleave_planar_rgba(planes: &[Vec<u8>], out: &mut [u8]) {
+    assert!(planes.len() >= 4);
+    let n = planes[0].len();
+    debug_assert_eq!(planes[1].len(), n);
+    debug_assert_eq!(planes[2].len(), n);
+    debug_assert_eq!(planes[3].len(), n);
+    debug_assert_eq!(out.len(), n * 4);
+
+    unsafe {
+        let mut pr = planes[0].as_ptr();
+        let mut pg = planes[1].as_ptr();
+        let mut pb = planes[2].as_ptr();
+        let mut pa = planes[3].as_ptr();
+        let mut po = out.as_mut_ptr();
+
+        for _ in 0..n {
+            *po = *pr;
+            po = po.add(1);
+            pr = pr.add(1);
+
+            *po = *pg;
+            po = po.add(1);
+            pg = pg.add(1);
+
+            *po = *pb;
+            po = po.add(1);
+            pb = pb.add(1);
+
+            *po = *pa;
+            po = po.add(1);
+            pa = pa.add(1);
+        }
+    }
+}
+
 /// Encode: if input is file -> single file.
 /// If input is directory + recursive=true -> recurse.
 fn encode_cmd(
@@ -288,7 +364,7 @@ fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
 }
 
 /// Encode one image file into one .vrawtex
-/// Планар делаем стримингом по строкам + chunk-буфера → не держим весь planar в памяти, но даём zstd жирные куски.
+/// Стриминг + чанк-буферы + SIMD-дружественная раскладка RGBA→planar.
 fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
 
@@ -366,11 +442,17 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     enc_a.multithread(ZSTD_WORKERS)?;
     enc_a.set_pledged_src_size(Some(pledged))?;
 
-    // Буферы для накопления чанк-data по каналам
+    // Буферы для накопления чанков по каналам
     let mut buf_r = Vec::with_capacity(CHUNK_TARGET);
     let mut buf_g = Vec::with_capacity(CHUNK_TARGET);
     let mut buf_b = Vec::with_capacity(CHUNK_TARGET);
     let mut buf_a = Vec::with_capacity(CHUNK_TARGET);
+
+    // Временные row-буферы для SIMD-дружественного deinterleave
+    let mut row_r = vec![0u8; width_usize];
+    let mut row_g = vec![0u8; width_usize];
+    let mut row_b = vec![0u8; width_usize];
+    let mut row_a = vec![0u8; width_usize];
 
     let stride = width_usize * 4;
 
@@ -379,16 +461,19 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     for y in 0..height_usize {
         let row_rgba = &rgba_bytes[y * stride..(y + 1) * stride];
 
-        // Раскидываем по каналам + копим в чанки
-        for x in 0..width_usize {
-            let idx = x * 4;
-            buf_r.push(row_rgba[idx]);
-            buf_g.push(row_rgba[idx + 1]);
-            buf_b.push(row_rgba[idx + 2]);
-            buf_a.push(row_rgba[idx + 3]);
-        }
+        deinterleave_rgba_row_to_planar(
+            row_rgba,
+            &mut row_r,
+            &mut row_g,
+            &mut row_b,
+            &mut row_a,
+        );
 
-        // Если чанк набился достаточно — пушим в zstd и чистим
+        buf_r.extend_from_slice(&row_r);
+        buf_g.extend_from_slice(&row_g);
+        buf_b.extend_from_slice(&row_b);
+        buf_a.extend_from_slice(&row_a);
+
         if buf_r.len() >= CHUNK_TARGET {
             enc_r.write_all(&buf_r)?;
             buf_r.clear();
@@ -701,9 +786,15 @@ fn decode_cmd(
             let pixels_count_usize = pixels as usize;
             let mut interleaved = vec![0u8; pixels_count_usize * chans_usize];
 
-            for i in 0..pixels_count_usize {
-                for c in 0..chans_usize {
-                    interleaved[i * chans_usize + c] = planes[c][i];
+            if chans == 4 {
+                // SIMD-дружественный путь
+                interleave_planar_rgba(&planes, &mut interleaved);
+            } else {
+                // fallback на всякий
+                for i in 0..pixels_count_usize {
+                    for c in 0..chans_usize {
+                        interleaved[i * chans_usize + c] = planes[c][i];
+                    }
                 }
             }
 
