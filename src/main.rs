@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use image::{DynamicImage, GenericImageView, ColorType};
 use lz4::block::{self, CompressionMode};
+use minifb::{Key, Window, WindowOptions};
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-
+use std::thread;
+use std::time::{Duration, Instant};
+use walkdir::WalkDir;
+const MAX_WINDOW_WIDTH: usize = 1280;
+const MAX_WINDOW_HEIGHT: usize = 720;
 fn main() {
     if let Err(e) = run() {
         eprintln!("Error: {e}");
@@ -18,11 +22,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Encode { input, output } => {
-            encode_cmd(input, output, cli.verbose)?;
+        Command::Encode {
+            input,
+            output,
+            recursive,
+        } => {
+            encode_cmd(input, output, recursive, cli.verbose)?;
         }
         Command::Decode { input, output, to } => {
             decode_cmd(input, output, to, cli.verbose)?;
+        }
+        Command::Open { input } => {
+            open_cmd(input, cli.verbose)?;
         }
     }
 
@@ -42,13 +53,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encode any image file into .vrawtex
+    /// Encode any image file or directory into .vrawtex
     Encode {
-        /// Input image (jpg/png/etc)
+        /// Input image OR directory
         input: PathBuf,
 
-        /// Output .vrawtex (optional, defaults to input with .vrawtex)
+        /// Output .vrawtex (only for single-file encode).
+        /// If not set, defaults to input with .vrawtex
         output: Option<PathBuf>,
+
+        /// If input is a directory: process it recursively into sibling VRAWTEXed/
+        #[arg(short = 'r', long = "recursive")]
+        recursive: bool,
     },
 
     /// Decode .vrawtex into RAW or PNG
@@ -66,6 +82,12 @@ enum Command {
         /// Decode target: raw (planar) or png
         #[arg(short = 't', long = "to", value_enum, default_value_t = DecodeFormat::Png)]
         to: DecodeFormat,
+    },
+
+    /// Открыть .vrawtex в окне, без сохранения PNG/RAW
+    Open {
+        /// Input .vrawtex file
+        input: PathBuf,
     },
 }
 
@@ -120,26 +142,135 @@ fn channel_name(idx: usize, chans: u8) -> String {
     }
 }
 
+/// Форматирование Duration до наносекунд: "0.000000123 sec"
+fn format_duration_ns(d: Duration) -> String {
+    let secs = d.as_secs();
+    let nanos = d.subsec_nanos();
+    if secs == 0 {
+        format!("0.{:09} sec", nanos)
+    } else {
+        format!("{}.{:09} sec", secs, nanos)
+    }
+}
+
 struct EncChannel {
     orig_size: u64,
     comp_size: u64,
     data: Vec<u8>,
 }
 
+/// Encode: если input — файл → один файл.
+/// Если input — директория + recursive=true → рекурсивно.
 fn encode_cmd(
     input: PathBuf,
     output: Option<PathBuf>,
+    recursive: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if input.is_dir() {
+        if !recursive {
+            return Err("input is a directory; use -r/--recursive to process it".into());
+        }
+        encode_dir(&input, verbose)?;
+        Ok(())
+    } else {
+        let out_path = output.unwrap_or_else(|| default_encode_output_path(&input));
+        encode_one(&input, &out_path, verbose)?;
+        Ok(())
+    }
+}
+
+/// Рекурсивный encode директории:
+/// <root>/something.png -> <root_parent>/VRAWTEXed/<relative>/something.vrawtex
+fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
+    if verbose {
+        println!("[vrawtex] Recursive encode of directory: {}", root.display());
+    }
+
+    let root = root.canonicalize()?;
+    let parent = root.parent().unwrap_or(&root);
+    let target_root = parent.join("VRAWTEXed");
+    fs::create_dir_all(&target_root)?;
+
+    let mut processed = 0usize;
+    let mut failed = 0usize;
+
+    for entry in WalkDir::new(&root).follow_links(true) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                if verbose {
+                    eprintln!("[vrawtex] Walk error: {e}");
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        let rel = match path.strip_prefix(&root) {
+            Ok(r) => r,
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "[vrawtex] strip_prefix failed for {}: {e}",
+                        path.display()
+                    );
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
+        let mut out_path = target_root.join(rel);
+        out_path.set_extension("vrawtex");
+
+        if let Some(parent_dir) = out_path.parent() {
+            fs::create_dir_all(parent_dir)?;
+        }
+
+        match encode_one(path, &out_path, verbose) {
+            Ok(_) => {
+                processed += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                if verbose {
+                    eprintln!(
+                        "[vrawtex] Failed to encode {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if verbose {
+        println!(
+            "[vrawtex] Done. Processed {} file(s), failed {}. Output root: {}",
+            processed,
+            failed,
+            target_root.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Кодирование одного файла в один .vrawtex
+fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
 
-    // Размер исходного файла (PNG/JPG/whatever)
-    let original_size = fs::metadata(&input)
+    let original_size = fs::metadata(input)
         .map(|m| m.len())
         .unwrap_or(0);
 
-    // 1) читаем картинку через image crate
-    let img = image::open(&input)?;
+    let img = image::open(input)?;
     let (width, height) = img.dimensions();
 
     if verbose {
@@ -151,9 +282,8 @@ fn encode_cmd(
         );
     }
 
-    // Всё приводим к RGBA8 (4 канала, 8 бит)
     let rgba: DynamicImage = img.to_rgba8().into();
-    let rgba_bytes = rgba.into_bytes(); // Vec<u8>, interleaved RGBA
+    let rgba_bytes = rgba.into_bytes();
 
     let width_u32 = width;
     let height_u32 = height;
@@ -164,7 +294,7 @@ fn encode_cmd(
 
     let chans: u8 = 4;
     let chans_u64 = chans as u64;
-    let bytes_per_sample: u64 = 1; // u8
+    let bytes_per_sample: u64 = 1;
 
     let plane_size = pixels_count
         .checked_mul(bytes_per_sample)
@@ -179,7 +309,6 @@ fn encode_cmd(
 
     let plane_size_usize = plane_size as usize;
 
-    // 2) раскладываем в planar: [R..][G..][B..][A..]
     let mut planes: Vec<Vec<u8>> = vec![vec![0u8; plane_size_usize]; chans as usize];
 
     let mut idx = 0usize;
@@ -196,14 +325,11 @@ fn encode_cmd(
         planes[3][i] = a;
     }
 
-    // 3) собираем заголовок vrawtex
-    // pixfmt = 0x0001 (U8), qval = 0, chans = 4
     let pixfmt_bits: u16 = 0x0001;
     let qval: u8 = 0;
     let flags = build_flags(pixfmt_bits, qval, chans);
     let dimmask = build_dimmask(width_u32, height_u32);
 
-    // 4) компрессим каждый канал через LZ4HC в параллель
     let orig_size = plane_size;
     let comp_mode = CompressionMode::HIGHCOMPRESSION(12);
 
@@ -223,7 +349,6 @@ fn encode_cmd(
     let channels = channels_res?;
     let elapsed_enc = start_enc.elapsed();
 
-    // 5) собираем финальный буфер
     let mut total_comp_data: u64 = 0;
     for ch in &channels {
         total_comp_data = total_comp_data
@@ -231,8 +356,8 @@ fn encode_cmd(
             .ok_or("compressed data size overflow")?;
     }
 
-    let header_size: u64 = 4 + 8; // flags + dimmask
-    let per_channel_overhead: u64 = 16; // orig_size u64 + comp_size u64
+    let header_size: u64 = 4 + 8;
+    let per_channel_overhead: u64 = 16;
     let total_overhead = per_channel_overhead
         .checked_mul(chans_u64)
         .ok_or("overhead overflow")?;
@@ -255,17 +380,10 @@ fn encode_cmd(
         out.extend_from_slice(&ch.data);
     }
 
-    // 6) определяем выходной путь
-    let out_path = match output {
-        Some(p) => p,
-        None => default_encode_output_path(&input),
-    };
-
-    fs::write(&out_path, &out)?;
+    fs::write(out_path, &out)?;
     let vrawtex_size = out.len() as u64;
     let elapsed_total = start_total.elapsed();
 
-    // короткий вывод всегда
     println!(
         "Encoded {}x{} RGBA8 -> {}",
         width_u32,
@@ -274,10 +392,7 @@ fn encode_cmd(
     );
 
     if verbose {
-        println!(
-            "RAW planar size: {} bytes",
-            raw_planar_size
-        );
+        println!("RAW planar size: {} bytes", raw_planar_size);
         println!("Channel sizes (orig/comp):");
 
         for (i, ch) in channels.iter().enumerate() {
@@ -291,10 +406,7 @@ fn encode_cmd(
             );
         }
 
-        println!(
-            "Total vrawtex size: {} bytes",
-            vrawtex_size
-        );
+        println!("Total vrawtex size: {} bytes", vrawtex_size);
 
         if original_size > 0 {
             println!(
@@ -314,15 +426,21 @@ fn encode_cmd(
         let ratio = raw_planar_size as f64 / vrawtex_size as f64;
         println!("Compression ratio vs raw: {:.2}x smaller", ratio);
 
+        println!(
+            "Encoding time (compress): {}",
+            format_duration_ns(elapsed_enc)
+        );
+
         let secs = elapsed_enc.as_secs_f64();
         if secs > 0.0 {
             let speed_mb = raw_planar_size as f64 / secs / (1024.0 * 1024.0);
-            println!("Encoding time (compress): {:.2} sec", secs);
             println!("Speed: {:.1} MB/s", speed_mb);
         }
 
-        let total_secs = elapsed_total.as_secs_f64();
-        println!("Total encode time (full pipeline): {:.2} sec", total_secs);
+        println!(
+            "Total encode time (full pipeline): {}",
+            format_duration_ns(elapsed_total)
+        );
     }
 
     Ok(())
@@ -352,7 +470,6 @@ fn decode_cmd(
         return Err("invalid header: channels == 0".into());
     }
 
-    // Сейчас поддерживаем только U8 без Q-форматов
     if !(pixfmt_bits == 0x0001 && qval == 0) {
         return Err(format!(
             "unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}, qval={qval}"
@@ -393,7 +510,6 @@ fn decode_cmd(
         );
     }
 
-    // читаем и распаковываем каналы (пока последовательно)
     let mut planes: Vec<Vec<u8>> = Vec::with_capacity(chans_usize);
     let mut comp_sizes: Vec<u64> = Vec::with_capacity(chans_usize);
 
@@ -427,8 +543,7 @@ fn decode_cmd(
         let comp_slice = &data[offset..offset + comp_size_usize];
         offset += comp_size_usize;
 
-        let decompressed =
-            block::decompress(comp_slice, Some(orig_size as i32))?;
+        let decompressed = block::decompress(comp_slice, Some(orig_size as i32))?;
         if decompressed.len() != plane_size_usize {
             return Err(format!(
                 "decompressed size mismatch: expected {}, got {}",
@@ -447,16 +562,15 @@ fn decode_cmd(
     }
 
     let elapsed_dec = start_dec.elapsed();
+    let elapsed_total = start_total.elapsed();
 
-    // Определяем базовое имя для output
     let base = match output {
         Some(p) => p,
         None => default_decode_base_path(&input),
     };
-    let elapsed_total = start_total.elapsed();
+
     match to {
         DecodeFormat::Raw => {
-            // planar RAW: [chan0][chan1][chan2]...
             let mut raw_bytes: Vec<u8> = Vec::with_capacity(raw_planar_size as usize);
             for c in 0..chans_usize {
                 raw_bytes.extend_from_slice(&planes[c]);
@@ -486,7 +600,6 @@ fn decode_cmd(
             }
         }
         DecodeFormat::Png => {
-            // Собираем interleaved
             let pixels_count_usize = pixels as usize;
             let mut interleaved = vec![0u8; pixels_count_usize * chans_usize];
 
@@ -544,14 +657,259 @@ fn decode_cmd(
 
     Ok(())
 }
+/// Просто открыть vrawtex в окне, без записи файлов (через minifb).
+fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
+    let start_total = Instant::now();
+
+    let data = fs::read(&input)?;
+    if data.len() < 12 {
+        return Err("file too small to be vrawtex (need at least 12 bytes)".into());
+    }
+
+    let file_size = data.len() as u64;
+
+    let flags = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let dimmask = u64::from_le_bytes(data[4..12].try_into().unwrap());
+    let mut offset = 12usize;
+
+    let (pixfmt_bits, qval, chans) = parse_flags(flags);
+    if chans == 0 {
+        return Err("invalid header: channels == 0".into());
+    }
+
+    // сейчас поддерживаем только U8
+    if !(pixfmt_bits == 0x0001 && qval == 0) {
+        return Err(format!(
+            "unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}, qval={qval}"
+        )
+        .into());
+    }
+
+    let chans_usize = chans as usize;
+    let (width, height) = parse_dimmask(dimmask);
+
+    let w = width as u64;
+    let h = height as u64;
+    let bytes_per_sample: u64 = 1;
+
+    let pixels = w
+        .checked_mul(h)
+        .ok_or("width * height overflow")?;
+    let plane_size = pixels
+        .checked_mul(bytes_per_sample)
+        .ok_or("plane size overflow")?;
+    let raw_planar_size = plane_size
+        .checked_mul(chans as u64)
+        .ok_or("raw planar size overflow")?;
+
+    if plane_size > usize::MAX as u64 || raw_planar_size > usize::MAX as u64 {
+        return Err("image too large for this build (usize overflow)".into());
+    }
+
+    let plane_size_usize = plane_size as usize;
+
+    if verbose {
+        println!(
+            "[vrawtex] Opening {} ({}x{}, {} channels, U8)",
+            input.display(),
+            width,
+            height,
+            chans
+        );
+    }
+
+    // ---------- декод каналов ----------
+    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(chans_usize);
+    let mut comp_sizes: Vec<u64> = Vec::with_capacity(chans_usize);
+
+    let start_dec = Instant::now();
+
+    for _c in 0..chans_usize {
+        if offset + 16 > data.len() {
+            return Err("truncated file while reading channel header".into());
+        }
+
+        let orig_size = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let comp_size = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+        offset += 16;
+
+        if orig_size != plane_size {
+            return Err(format!(
+                "channel orig_size ({orig_size}) != expected plane_size ({plane_size})"
+            )
+            .into());
+        }
+
+        if comp_size > (data.len() - offset) as u64 {
+            return Err("truncated file: comp_size goes past EOF".into());
+        }
+
+        if orig_size > i32::MAX as u64 {
+            return Err("orig_size exceeds lz4::block limit (i32::MAX)".into());
+        }
+
+        let comp_size_usize = comp_size as usize;
+        let comp_slice = &data[offset..offset + comp_size_usize];
+        offset += comp_size_usize;
+
+        let decompressed =
+            lz4::block::decompress(comp_slice, Some(orig_size as i32))?;
+        if decompressed.len() != plane_size_usize {
+            return Err(format!(
+                "decompressed size mismatch: expected {}, got {}",
+                plane_size_usize,
+                decompressed.len()
+            )
+            .into());
+        }
+
+        planes.push(decompressed);
+        comp_sizes.push(comp_size);
+    }
+
+    if planes.len() != chans_usize {
+        return Err("not enough channels decoded".into());
+    }
+
+    let elapsed_dec = start_dec.elapsed();
+    let elapsed_total = start_total.elapsed();
+
+    let img_w = width as usize;
+    let img_h = height as usize;
+
+    // стартовый размер окна — влезть в MAX_* по большей стороне
+    let mut init_w = img_w;
+    let mut init_h = img_h;
+    if init_w > MAX_WINDOW_WIDTH || init_h > MAX_WINDOW_HEIGHT {
+        let sx = MAX_WINDOW_WIDTH as f64 / init_w as f64;
+        let sy = MAX_WINDOW_HEIGHT as f64 / init_h as f64;
+        let scale = sx.min(sy);
+        init_w = (init_w as f64 * scale).round() as usize;
+        init_h = (init_h as f64 * scale).round() as usize;
+    }
+
+    let mut window = Window::new(
+        &format!("vrawtex: {}", input.display()),
+        init_w,
+        init_h,
+        WindowOptions {
+            resize: true,
+            ..WindowOptions::default()
+        },
+    )?;
+
+    // основной цикл: окно ресайзится, мы подгоняем картинку
+    let mut fb: Vec<u32> = Vec::new();
+    let tile = 8usize; // размер клетки шахматки
+
+    println!(
+        "Opened {}x{} ({} channels) from {} (ESC to close)",
+        width,
+        height,
+        chans,
+        input.display()
+    );
+
+    if verbose {
+        print_decode_stats(
+            file_size,
+            raw_planar_size,
+            &comp_sizes,
+            chans,
+            elapsed_dec,
+            elapsed_total,
+            "VIEW",
+            &input,
+        );
+    }
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let (win_w, win_h) = window.get_size();
+
+        if win_w == 0 || win_h == 0 {
+            window.update();
+            thread::sleep(Duration::from_millis(16));
+            continue;
+        }
+
+        if fb.len() != win_w * win_h {
+            fb.resize(win_w * win_h, 0);
+        }
+
+        // масштаб с сохранением пропорций, плюс центрирование
+        let sx = win_w as f64 / img_w as f64;
+        let sy = win_h as f64 / img_h as f64;
+        let scale = sx.min(sy);
+
+        let draw_w = (img_w as f64 * scale).max(1.0).round() as usize;
+        let draw_h = (img_h as f64 * scale).max(1.0).round() as usize;
+
+        let off_x = (win_w.saturating_sub(draw_w)) / 2;
+        let off_y = (win_h.saturating_sub(draw_h)) / 2;
+
+                for y in 0..win_h {
+            for x in 0..win_w {
+                // фон всегда чёрный
+                let bg_r: u32 = 0;
+                let bg_g: u32 = 0;
+                let bg_b: u32 = 0;
+            
+                let mut out_r = bg_r;
+                let mut out_g = bg_g;
+                let mut out_b = bg_b;
+            
+                if x >= off_x && x < off_x + draw_w && y >= off_y && y < off_y + draw_h {
+                    let rel_x = (x - off_x) as f64 + 0.5;
+                    let rel_y = (y - off_y) as f64 + 0.5;
+                
+                    let src_x_f = rel_x / draw_w as f64 * img_w as f64;
+                    let src_y_f = rel_y / draw_h as f64 * img_h as f64;
+                
+                    let mut src_x = src_x_f.floor() as isize;
+                    let mut src_y = src_y_f.floor() as isize;
+                
+                    if src_x < 0 { src_x = 0; }
+                    if src_y < 0 { src_y = 0; }
+                    if src_x >= img_w as isize { src_x = img_w as isize - 1; }
+                    if src_y >= img_h as isize { src_y = img_h as isize - 1; }
+                
+                    let src_x = src_x as usize;
+                    let src_y = src_y as usize;
+                    let src_idx = src_y * img_w + src_x;
+                
+                    let sr = planes[0][src_idx] as u32;
+                    let sg = if chans_usize > 1 { planes[1][src_idx] as u32 } else { sr };
+                    let sb = if chans_usize > 2 { planes[2][src_idx] as u32 } else { sr };
+                    let sa = if chans_usize > 3 { planes[3][src_idx] as u32 } else { 255 };
+                
+                    let a = sa;
+                    let ia = 255 - a;
+                
+                    out_r = (sr * a + bg_r * ia + 127) / 255;
+                    out_g = (sg * a + bg_g * ia + 127) / 255;
+                    out_b = (sb * a + bg_b * ia + 127) / 255;
+                }
+            
+                fb[y * win_w + x] = (out_r << 16) | (out_g << 8) | out_b;
+            }
+        }
+
+
+        window.update_with_buffer(&fb, win_w, win_h)?;
+        thread::sleep(Duration::from_millis(16));
+    }
+
+    Ok(())
+}
+
 
 fn print_decode_stats(
     file_size: u64,
     raw_planar_size: u64,
     comp_sizes: &[u64],
     chans: u8,
-    elapsed_dec: std::time::Duration,
-    elapsed_total: std::time::Duration,
+    elapsed_dec: Duration,
+    elapsed_total: Duration,
     target_kind: &str,
     out_path: &Path,
 ) {
@@ -571,21 +929,23 @@ fn print_decode_stats(
         );
     }
 
+    println!("Decoded to {}: {}", target_kind, out_path.display());
+
     println!(
-        "Decoded to {}: {}",
-        target_kind,
-        out_path.display()
+        "Decoding time (decompress+build): {}",
+        format_duration_ns(elapsed_dec)
     );
 
     let secs = elapsed_dec.as_secs_f64();
     if secs > 0.0 {
         let speed_mb = raw_planar_size as f64 / secs / (1024.0 * 1024.0);
-        println!("Decoding time (decompress+build): {:.2} sec", secs);
         println!("Speed: {:.1} MB/s", speed_mb);
     }
 
-    let total_secs = elapsed_total.as_secs_f64();
-    println!("Total decode time (full pipeline): {:.2} sec", total_secs);
+    println!(
+        "Total decode time (full pipeline): {}",
+        format_duration_ns(elapsed_total)
+    );
 }
 
 fn default_encode_output_path(input: &Path) -> PathBuf {
