@@ -1,5 +1,8 @@
+mod atlas;
+mod lanczos;
+
 use clap::{Parser, Subcommand, ValueEnum};
-use image::{ColorType, GenericImageView};
+use image::{ColorType, GenericImageView, RgbaImage};
 use minifb::{Key, Window, WindowOptions};
 use std::error::Error;
 use std::fs;
@@ -13,9 +16,8 @@ use zstd::{bulk, stream::Encoder};
 const MAX_WINDOW_WIDTH: usize = 1920;
 const MAX_WINDOW_HEIGHT: usize = 1080;
 
-// Твои любимые ручки:
 const ZSTD_LEVEL: i32 = 10;
-const ZSTD_WORKERS: u32 = 6;
+const ZSTD_WORKERS_TOTAL: u32 = 8;
 const CHUNK_TARGET: usize = 128 * 1024;
 
 // Включаем delta всегда (можно потом вывести в CLI)
@@ -46,8 +48,22 @@ fn run() -> Result<(), Box<dyn Error>> {
             output,
             recursive,
         } => encode_cmd(input, output, recursive, cli.verbose),
+
         Command::Decode { input, output, to } => decode_cmd(input, output, to, cli.verbose),
+
         Command::Open { input } => open_cmd(input, cli.verbose),
+
+        Command::Atlas {
+            inputs,
+            output,
+            max_side,
+            pad,
+        } => {
+            if inputs.is_empty() {
+                return Err("atlas: need at least one INPUT (file or directory)".into());
+            }
+            atlas::atlas_cmd(inputs, output, max_side, pad, cli.verbose)
+        }
     }
 }
 
@@ -96,6 +112,25 @@ enum Command {
         /// Input .vrawtex file
         input: PathBuf,
     },
+
+    /// Build texture atlas .vrawtex from many images (and/or directories)
+    Atlas {
+        /// Input images and/or directories (directories scanned recursively for images)
+        #[arg(value_name = "INPUTS")]
+        inputs: Vec<PathBuf>,
+
+        /// Output file (optional). Default: ./atlas.vrawtex
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+
+        /// Max atlas side (default 16384)
+        #[arg(long = "max-side")]
+        max_side: Option<u32>,
+
+        /// Padding pixels around each texture (default 2)
+        #[arg(long = "pad")]
+        pad: Option<u32>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -106,7 +141,7 @@ enum DecodeFormat {
 
 /// FLAGS layout:
 /// 31..16 = PIXFMT (u16)
-/// 15..8  = QVAL   (u8)  <-- we use this as FEATURE BYTE
+/// 15..8  = QVAL   (u8)  <-- feature byte
 /// 7..0   = CHANS  (u8)
 fn build_flags(pixfmt: u16, qval: u8, chans: u8) -> u32 {
     ((pixfmt as u32) << 16) | ((qval as u32) << 8) | (chans as u32)
@@ -264,15 +299,22 @@ fn delta_decode_row_inplace(row: &mut [u8]) {
     }
 }
 
-fn delta_decode_plane_inplace(plane: &mut [u8], width: usize, height: usize) -> Result<(), Box<dyn Error>> {
+fn delta_decode_plane_inplace(
+    plane: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<(), Box<dyn Error>> {
     if width == 0 || height == 0 {
         return Ok(());
     }
-    let expected = width
-        .checked_mul(height)
-        .ok_or("delta decode overflow")?;
+    let expected = width.checked_mul(height).ok_or("delta decode overflow")?;
     if plane.len() != expected {
-        return Err(format!("delta decode plane size mismatch: got {}, expected {}", plane.len(), expected).into());
+        return Err(format!(
+            "delta decode plane size mismatch: got {}, expected {}",
+            plane.len(),
+            expected
+        )
+        .into());
     }
     for y in 0..height {
         let row = &mut plane[y * width..(y + 1) * width];
@@ -285,7 +327,7 @@ fn detect_alpha_mode(rgba_bytes: &[u8]) -> AlphaMode {
     if rgba_bytes.len() < 4 {
         return AlphaMode::Normal;
     }
-    let mut first = rgba_bytes[3];
+    let first = rgba_bytes[3];
     let mut all_same = true;
     let mut binary = true;
 
@@ -308,7 +350,6 @@ fn detect_alpha_mode(rgba_bytes: &[u8]) -> AlphaMode {
         } else if first == 0 {
             AlphaMode::Transparent0
         } else {
-            // константа “не 0/255” — оставляем как normal (можно потом расширить формат)
             AlphaMode::Normal
         }
     } else if binary {
@@ -318,15 +359,22 @@ fn detect_alpha_mode(rgba_bytes: &[u8]) -> AlphaMode {
     }
 }
 
-fn feature_byte(delta: bool, alpha_mode: AlphaMode) -> u8 {
+/// Feature byte bits:
+/// bit0 = delta
+/// bit1..2 = alpha_mode (0..3)
+/// bit3 = has_meta
+fn feature_byte(delta: bool, alpha_mode: AlphaMode, has_meta: bool) -> u8 {
     let d = if delta { 1u8 } else { 0u8 };
     let am = (alpha_mode as u8) & 0x3;
-    d | (am << 1)
+    let m = if has_meta { 1u8 } else { 0u8 };
+    d | (am << 1) | (m << 3)
 }
 
-fn parse_feature_byte(qval: u8) -> (bool, AlphaMode) {
+fn parse_feature_byte(qval: u8) -> (bool, AlphaMode, bool) {
     let delta = (qval & 1) != 0;
     let am = (qval >> 1) & 0x3;
+    let has_meta = ((qval >> 3) & 1) != 0;
+
     let alpha_mode = match am {
         0 => AlphaMode::Normal,
         1 => AlphaMode::Opaque255,
@@ -334,10 +382,15 @@ fn parse_feature_byte(qval: u8) -> (bool, AlphaMode) {
         3 => AlphaMode::Mask1Bit,
         _ => AlphaMode::Normal,
     };
-    (delta, alpha_mode)
+    (delta, alpha_mode, has_meta)
 }
 
-fn encode_cmd(input: PathBuf, output: Option<PathBuf>, recursive: bool, verbose: bool) -> Result<(), Box<dyn Error>> {
+fn encode_cmd(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    recursive: bool,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
     if input.is_dir() {
         if !recursive {
             return Err("input is a directory; use -r/--recursive to process it".into());
@@ -379,8 +432,15 @@ fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
         }
 
         let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-        let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga" | "tif" | "tiff" | "gif");
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_image = matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "bmp" | "tga" | "tif" | "tiff" | "gif"
+        );
 
         if !is_image {
             skipped += 1;
@@ -439,21 +499,69 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     }
 
     let rgba = img.to_rgba8();
-    let rgba_bytes = rgba.into_raw();
+    let bytes = encode_rgba8_with_meta_to_vec(&rgba, None, verbose, Some(original_size), start_total)?;
+    fs::write(out_path, &bytes)?;
+
+    println!("Encoded {}x{} RGBA8 -> {}", width, height, out_path.display());
+    Ok(())
+}
+
+/// Делим workers_total на N стримов (3 или 4), “поровну”.
+/// Гарантируем минимум 1 на стрим.
+fn split_workers(workers_total: u32, streams: usize) -> Vec<u32> {
+    let streams_u32 = streams as u32;
+    if streams == 0 {
+        return Vec::new();
+    }
+    let mut base = workers_total / streams_u32;
+    let mut rem = workers_total % streams_u32;
+
+    if base == 0 {
+        base = 1;
+        rem = 0;
+    }
+
+    let mut out = vec![base; streams];
+    for i in 0..streams {
+        if rem == 0 {
+            break;
+        }
+        out[i] += 1;
+        rem -= 1;
+    }
+    out
+}
+
+/// Это ИМЕННО твой энкодер, но:
+/// - берет уже готовую RGBA8 картинку
+/// - опционально принимает meta-блок (msgpack bytes), который кладётся СРАЗУ ПОСЛЕ (flags+dimmask):
+///   [flags u32][dimmask u64][meta_len u32][meta bytes][streams...]
+pub(crate) fn encode_rgba8_with_meta_to_vec(
+    rgba: &RgbaImage,
+    meta: Option<&[u8]>,
+    verbose: bool,
+    original_size_opt: Option<u64>,
+    start_total: Instant,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let (width, height) = rgba.dimensions();
+    let rgba_bytes = rgba.as_raw();
 
     let width_usize = width as usize;
     let height_usize = height as usize;
 
-    let pixels_u64 = (width as u64).checked_mul(height as u64).ok_or("width*height overflow")?;
-    let plane_size_u64 = pixels_u64; // u8
+    let pixels_u64 = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or("width*height overflow")?;
+    let plane_size_u64 = pixels_u64; // u8 per channel
     let raw_planar_size_u64 = plane_size_u64.checked_mul(4).ok_or("raw size overflow")?;
 
     if plane_size_u64 > usize::MAX as u64 {
         return Err("plane too large for this build (usize overflow)".into());
     }
 
-    let alpha_mode = detect_alpha_mode(&rgba_bytes);
-    let qval = feature_byte(DELTA_ENABLED, alpha_mode);
+    let alpha_mode = detect_alpha_mode(rgba_bytes);
+    let has_meta = meta.is_some();
+    let qval = feature_byte(DELTA_ENABLED, alpha_mode, has_meta);
 
     let pixfmt_bits: u16 = 0x0001; // U8
     let chans: u8 = 4;
@@ -474,20 +582,24 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     let packed_alpha_size_usize = packed_alpha_size_u64 as usize;
 
     // streams actually stored:
-    let store_alpha_stream = !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
+    let store_alpha_stream =
+        !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
     let stored_streams = if store_alpha_stream { 4usize } else { 3usize };
+
+    // workers split
+    let ws = split_workers(ZSTD_WORKERS_TOTAL, stored_streams);
 
     // --- ZSTD streaming ---
     let mut enc_r = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
-    enc_r.multithread(ZSTD_WORKERS)?;
+    enc_r.multithread(ws[0])?;
     enc_r.set_pledged_src_size(Some(plane_size_u64))?;
 
     let mut enc_g = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
-    enc_g.multithread(ZSTD_WORKERS)?;
+    enc_g.multithread(ws[1.min(ws.len() - 1)])?;
     enc_g.set_pledged_src_size(Some(plane_size_u64))?;
 
     let mut enc_b = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
-    enc_b.multithread(ZSTD_WORKERS)?;
+    enc_b.multithread(ws[2.min(ws.len() - 1)])?;
     enc_b.set_pledged_src_size(Some(plane_size_u64))?;
 
     let mut enc_a_opt: Option<Encoder<'static, Vec<u8>>> = None;
@@ -498,7 +610,7 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
             plane_size_u64
         };
         let mut enc_a = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
-        enc_a.multithread(ZSTD_WORKERS)?;
+        enc_a.multithread(ws[3.min(ws.len() - 1)])?;
         enc_a.set_pledged_src_size(Some(pledged))?;
         enc_a_opt = Some(enc_a);
     }
@@ -621,17 +733,15 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
                     enc_a.write_all(&buf_amask)?;
                 }
             }
-            // sanity (best effort)
-            if packed_written != packed_alpha_size_usize {
-                // if mismatch, still write — but verbose can show
-            }
+            // best-effort sanity
+            let _ = packed_alpha_size_usize;
+            let _ = packed_written;
         }
     }
 
     let writer_r = enc_r.finish()?;
     let writer_g = enc_g.finish()?;
     let writer_b = enc_b.finish()?;
-
     let writer_a = if let Some(enc_a) = enc_a_opt {
         enc_a.finish()?
     } else {
@@ -639,6 +749,7 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     };
 
     let elapsed_enc = start_enc.elapsed();
+    let elapsed_total = start_total.elapsed();
 
     // Build channels vector in stored order: R,G,B,(A?)
     let mut channels: Vec<EncChannel> = Vec::with_capacity(stored_streams);
@@ -679,17 +790,36 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     // Container assembly
     let mut total_comp_data: u64 = 0;
     for ch in &channels {
-        total_comp_data = total_comp_data.checked_add(ch.comp_size).ok_or("comp size overflow")?;
+        total_comp_data = total_comp_data
+            .checked_add(ch.comp_size)
+            .ok_or("comp size overflow")?;
     }
 
+    let meta_len_u32: u32 = match meta {
+        Some(m) => {
+            if m.len() > u32::MAX as usize {
+                return Err("meta too large".into());
+            }
+            m.len() as u32
+        }
+        None => 0,
+    };
+
     let header_size: u64 = 4 + 8; // flags + dimmask
+    let meta_overhead: u64 = if has_meta {
+        4u64 + meta_len_u32 as u64
+    } else {
+        0
+    };
+
     let per_stream_overhead: u64 = 16; // orig_size + comp_size
     let overhead = per_stream_overhead
         .checked_mul(channels.len() as u64)
         .ok_or("overhead overflow")?;
 
     let out_capacity = header_size
-        .checked_add(overhead)
+        .checked_add(meta_overhead)
+        .and_then(|x| x.checked_add(overhead))
         .and_then(|x| x.checked_add(total_comp_data))
         .ok_or("out size overflow")?;
 
@@ -701,33 +831,36 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&dimmask.to_le_bytes());
 
+    if has_meta {
+        out.extend_from_slice(&meta_len_u32.to_le_bytes());
+        if let Some(m) = meta {
+            out.extend_from_slice(m);
+        }
+    }
+
     for ch in &channels {
         out.extend_from_slice(&ch.orig_size.to_le_bytes());
         out.extend_from_slice(&ch.comp_size.to_le_bytes());
         out.extend_from_slice(&ch.data);
     }
 
-    fs::write(out_path, &out)?;
-    let vrawtex_size = out.len() as u64;
-    let elapsed_total = start_total.elapsed();
-
-    println!("Encoded {}x{} RGBA8 -> {}", width, height, out_path.display());
-
     if verbose {
         println!(
-            "[vrawtex] Features: delta={}, alpha_mode={:?}, chunk={} bytes, zstd_level={}, workers={}",
-            DELTA_ENABLED, alpha_mode, CHUNK_TARGET, ZSTD_LEVEL, ZSTD_WORKERS
+            "[vrawtex] Features: delta={}, alpha_mode={:?}, has_meta={}, chunk={} bytes, zstd_level={}, workers_total={} (split={:?})",
+            DELTA_ENABLED, alpha_mode, has_meta, CHUNK_TARGET, ZSTD_LEVEL, ZSTD_WORKERS_TOTAL, ws
         );
+
+        if has_meta {
+            println!("[vrawtex] Meta: {} bytes", meta_len_u32);
+        }
 
         println!("RAW planar size: {} bytes", raw_planar_size_u64);
         println!("Channel sizes (orig/comp):");
 
-        // R/G/B always
         for (i, ch) in channels.iter().enumerate() {
             let pct = (ch.comp_size as f64 / ch.orig_size as f64) * 100.0;
             println!("  {}: {} -> {} ({:.1}%)", ch.name, ch.orig_size, ch.comp_size, pct);
 
-            // if A omitted, we'll print separately below
             if i == 2 && !store_alpha_stream {
                 let msg = match alpha_mode {
                     AlphaMode::Opaque255 => "A: ALL 255 (not stored)",
@@ -738,17 +871,21 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
             }
         }
 
+        let vrawtex_size = out.len() as u64;
         println!("Total vrawtex size: {} bytes", vrawtex_size);
-        if original_size > 0 {
-            println!(
-                "Original size -> RAW Planar -> VRAWTEX: {} -> {} -> {}",
-                human_mb(original_size),
-                human_mb(raw_planar_size_u64),
-                human_mb(vrawtex_size)
-            );
+
+        if let Some(original_size) = original_size_opt {
+            if original_size > 0 {
+                println!(
+                    "Original size -> RAW Planar -> VRAWTEX: {} -> {} -> {}",
+                    human_mb(original_size),
+                    human_mb(raw_planar_size_u64),
+                    human_mb(vrawtex_size)
+                );
+            }
         }
 
-        let ratio = raw_planar_size_u64 as f64 / vrawtex_size as f64;
+        let ratio = raw_planar_size_u64 as f64 / (out.len() as f64);
         println!("Compression ratio vs raw: {:.2}x smaller", ratio);
 
         println!("Encoding time (compress): {}", format_duration_ns(elapsed_enc));
@@ -760,6 +897,19 @@ fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dy
         println!("Total encode time (full pipeline): {}", format_duration_ns(elapsed_total));
     }
 
+    Ok(out)
+}
+
+/// Удобный враппер для atlas.rs: кодировать и сразу писать файл
+pub(crate) fn encode_rgba8_with_meta_to_file(
+    rgba: &RgbaImage,
+    meta: Option<&[u8]>,
+    out_path: &Path,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
+    let start_total = Instant::now();
+    let bytes = encode_rgba8_with_meta_to_vec(rgba, meta, verbose, None, start_total)?;
+    fs::write(out_path, &bytes)?;
     Ok(())
 }
 
@@ -782,7 +932,10 @@ fn read_streams(
 
         let expected = expected_sizes.get(i).copied().unwrap_or(orig_size);
         if orig_size != expected {
-            return Err(format!("stream orig_size mismatch: got {orig_size}, expected {expected} (stream #{i})").into());
+            return Err(format!(
+                "stream orig_size mismatch: got {orig_size}, expected {expected} (stream #{i})"
+            )
+            .into());
         }
 
         if comp_size > (data.len() - offset) as u64 {
@@ -809,7 +962,12 @@ fn read_streams(
     Ok((planes, comp_sizes, offset))
 }
 
-fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose: bool) -> Result<(), Box<dyn Error>> {
+fn decode_cmd(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    to: DecodeFormat,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
     let data = fs::read(&input)?;
     if data.len() < 12 {
@@ -830,14 +988,30 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
         return Err(format!("unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}").into());
     }
 
-    let (delta, alpha_mode) = parse_feature_byte(qval);
+    let (delta, alpha_mode, has_meta) = parse_feature_byte(qval);
     let (width, height) = parse_dimmask(dimmask);
+
+    // meta block
+    if has_meta {
+        if offset + 4 > data.len() {
+            return Err("truncated file: meta_len missing".into());
+        }
+        let meta_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + meta_len > data.len() {
+            return Err("truncated file: meta bytes missing".into());
+        }
+        // сейчас просто скипаем
+        offset += meta_len;
+    }
 
     let w = width as u64;
     let h = height as u64;
     let pixels = w.checked_mul(h).ok_or("width*height overflow")?;
     let plane_size = pixels;
-    let raw_planar_size = plane_size.checked_mul(chans as u64).ok_or("raw planar overflow")?;
+    let raw_planar_size = plane_size
+        .checked_mul(chans as u64)
+        .ok_or("raw planar overflow")?;
 
     if plane_size > usize::MAX as u64 {
         return Err("image too large (usize overflow)".into());
@@ -852,8 +1026,8 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
             chans
         );
         println!(
-            "[vrawtex] Features: delta={}, alpha_mode={:?}",
-            delta, alpha_mode
+            "[vrawtex] Features: delta={}, alpha_mode={:?}, has_meta={}",
+            delta, alpha_mode, has_meta
         );
     }
 
@@ -864,7 +1038,8 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
     let packed_alpha_size = (pixels + 7) / 8;
 
     // how many stored streams?
-    let store_alpha_stream = !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
+    let store_alpha_stream =
+        !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
     let stored_streams = if store_alpha_stream { 4usize } else { 3usize };
 
     let start_dec = Instant::now();
@@ -896,13 +1071,17 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
                 _ => vec![255u8; plane_size_usize],
             }
         } else if alpha_mode == AlphaMode::Mask1Bit {
-            // streams[0] is packed alpha
             if streams.is_empty() {
                 return Err("missing alpha mask stream".into());
             }
             let mask = streams.remove(0);
             if mask.len() != packed_alpha_size as usize {
-                return Err(format!("alpha mask size mismatch: got {}, expected {}", mask.len(), packed_alpha_size).into());
+                return Err(format!(
+                    "alpha mask size mismatch: got {}, expected {}",
+                    mask.len(),
+                    packed_alpha_size
+                )
+                .into());
             }
             let mut a = vec![0u8; plane_size_usize];
             for i in 0..plane_size_usize {
@@ -912,7 +1091,6 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
             }
             a
         } else {
-            // normal alpha stream
             if streams.is_empty() {
                 return Err("missing alpha stream".into());
             }
@@ -959,7 +1137,16 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
             );
 
             if verbose {
-                print_decode_stats(file_size, raw_planar_size, &comp_sizes, chans, elapsed_dec, elapsed_total, "RAW", &raw_path);
+                print_decode_stats(
+                    file_size,
+                    raw_planar_size,
+                    &comp_sizes,
+                    chans,
+                    elapsed_dec,
+                    elapsed_total,
+                    "RAW",
+                    &raw_path,
+                );
             }
         }
         DecodeFormat::Png => {
@@ -970,7 +1157,6 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
             if chans == 4 {
                 interleave_planar_rgba(&planes, &mut interleaved);
             } else {
-                // fallback for non-RGBA
                 for i in 0..pixels_count_usize {
                     for c in 0..chans_usize {
                         interleaved[i * chans_usize + c] = planes[c][i];
@@ -997,7 +1183,16 @@ fn decode_cmd(input: PathBuf, output: Option<PathBuf>, to: DecodeFormat, verbose
             );
 
             if verbose {
-                print_decode_stats(file_size, raw_planar_size, &comp_sizes, chans, elapsed_dec, elapsed_total, "PNG", &png_path);
+                print_decode_stats(
+                    file_size,
+                    raw_planar_size,
+                    &comp_sizes,
+                    chans,
+                    elapsed_dec,
+                    elapsed_total,
+                    "PNG",
+                    &png_path,
+                );
             }
         }
     }
@@ -1026,8 +1221,21 @@ fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
         return Err(format!("unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}").into());
     }
 
-    let (delta, alpha_mode) = parse_feature_byte(qval);
+    let (delta, alpha_mode, has_meta) = parse_feature_byte(qval);
     let (width, height) = parse_dimmask(dimmask);
+
+    // meta block
+    if has_meta {
+        if offset + 4 > data.len() {
+            return Err("truncated file: meta_len missing".into());
+        }
+        let meta_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + meta_len > data.len() {
+            return Err("truncated file: meta bytes missing".into());
+        }
+        offset += meta_len;
+    }
 
     let w = width as u64;
     let h = height as u64;
@@ -1041,7 +1249,9 @@ fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
     let plane_size_usize = plane_size as usize;
     let width_usize = width as usize;
     let height_usize = height as usize;
-    let raw_planar_size = plane_size.checked_mul(chans as u64).ok_or("raw planar overflow")?;
+    let raw_planar_size = plane_size
+        .checked_mul(chans as u64)
+        .ok_or("raw planar overflow")?;
 
     if verbose {
         println!(
@@ -1052,13 +1262,14 @@ fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
             chans
         );
         println!(
-            "[vrawtex] Features: delta={}, alpha_mode={:?}",
-            delta, alpha_mode
+            "[vrawtex] Features: delta={}, alpha_mode={:?}, has_meta={}",
+            delta, alpha_mode, has_meta
         );
     }
 
     let packed_alpha_size = (pixels + 7) / 8;
-    let store_alpha_stream = !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
+    let store_alpha_stream =
+        !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
     let stored_streams = if store_alpha_stream { 4usize } else { 3usize };
 
     // expected orig sizes per stored stream
@@ -1145,7 +1356,16 @@ fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
     );
 
     if verbose {
-        print_decode_stats(file_size, raw_planar_size, &comp_sizes, chans, elapsed_dec, elapsed_total, "VIEW", &input);
+        print_decode_stats(
+            file_size,
+            raw_planar_size,
+            &comp_sizes,
+            chans,
+            elapsed_dec,
+            elapsed_total,
+            "VIEW",
+            &input,
+        );
     }
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -1187,17 +1407,29 @@ fn open_cmd(input: PathBuf, verbose: bool) -> Result<(), Box<dyn Error>> {
                     let mut src_x = src_x_f.floor() as isize;
                     let mut src_y = src_y_f.floor() as isize;
 
-                    if src_x < 0 { src_x = 0; }
-                    if src_y < 0 { src_y = 0; }
-                    if src_x >= img_w as isize { src_x = img_w as isize - 1; }
-                    if src_y >= img_h as isize { src_y = img_h as isize - 1; }
+                    if src_x < 0 {
+                        src_x = 0;
+                    }
+                    if src_y < 0 {
+                        src_y = 0;
+                    }
+                    if src_x >= img_w as isize {
+                        src_x = img_w as isize - 1;
+                    }
+                    if src_y >= img_h as isize {
+                        src_y = img_h as isize - 1;
+                    }
 
                     let src_idx = (src_y as usize) * img_w + (src_x as usize);
 
                     let sr = planes[0][src_idx] as u32;
                     let sg = planes[1][src_idx] as u32;
                     let sb = planes[2][src_idx] as u32;
-                    let sa = if chans == 4 { planes[3][src_idx] as u32 } else { 255 };
+                    let sa = if chans == 4 {
+                        planes[3][src_idx] as u32
+                    } else {
+                        255
+                    };
 
                     // compose over black
                     out_r = (sr * sa + 127) / 255;
