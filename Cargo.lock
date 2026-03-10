@@ -1449,6 +1449,7 @@ dependencies = [
  "rayon",
  "rmp-serde",
  "serde",
+ "serde_json",
  "walkdir",
  "zstd",
 ]

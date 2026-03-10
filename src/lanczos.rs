@@ -188,26 +188,24 @@ pub fn resample_1d_rgb(src_rgb: &[u8], src_len: u32, dst_len: u32, radius_px: u3
     let kernels = build_kernels_1d(src_len, dst_len, radius_px);
     let mut out = vec![0u8; dst_len as usize * 3];
 
-    out.par_chunks_mut(3)
-        .enumerate()
-        .for_each(|(dx, pix)| {
-            let k = &kernels[dx];
+    out.par_chunks_mut(3).enumerate().for_each(|(dx, pix)| {
+        let k = &kernels[dx];
 
-            let mut acc_r: i64 = 0;
-            let mut acc_g: i64 = 0;
-            let mut acc_b: i64 = 0;
+        let mut acc_r: i64 = 0;
+        let mut acc_g: i64 = 0;
+        let mut acc_b: i64 = 0;
 
-            for (&idx, &wq) in k.indices.iter().zip(k.weights_q.iter()) {
-                let i = idx as usize * 3;
-                acc_r += (src_rgb[i] as i64) * wq;
-                acc_g += (src_rgb[i + 1] as i64) * wq;
-                acc_b += (src_rgb[i + 2] as i64) * wq;
-            }
+        for (&idx, &wq) in k.indices.iter().zip(k.weights_q.iter()) {
+            let i = idx as usize * 3;
+            acc_r += (src_rgb[i] as i64) * wq;
+            acc_g += (src_rgb[i + 1] as i64) * wq;
+            acc_b += (src_rgb[i + 2] as i64) * wq;
+        }
 
-            pix[0] = q_to_u8_from_acc_i64(acc_r);
-            pix[1] = q_to_u8_from_acc_i64(acc_g);
-            pix[2] = q_to_u8_from_acc_i64(acc_b);
-        });
+        pix[0] = q_to_u8_from_acc_i64(acc_r);
+        pix[1] = q_to_u8_from_acc_i64(acc_g);
+        pix[2] = q_to_u8_from_acc_i64(acc_b);
+    });
 
     out
 }
@@ -280,28 +278,30 @@ pub fn resize_lanczos_rgba(
         out_buf
             .par_chunks_mut(row_stride)
             .enumerate()
-            .for_each(|(dst_y, dst_row)| {
-                let k = &kernels_y[dst_y];
+            .for_each_init(
+                || vec![0i64; row_stride],
+                |acc, (dst_y, dst_row)| {
+                    let k = &kernels_y[dst_y];
+                    acc.fill(0);
 
-                let mut acc = vec![0i64; row_stride];
+                    for (&src_y, &wq) in k.indices.iter().zip(k.weights_q.iter()) {
+                        let src_off = src_y as usize * row_stride;
+                        let src_row = &tmp_buf[src_off..src_off + row_stride];
 
-                for (&src_y, &wq) in k.indices.iter().zip(k.weights_q.iter()) {
-                    let src_off = src_y as usize * row_stride;
-                    let src_row = &tmp_buf[src_off..src_off + row_stride];
-
-                    for i in 0..row_stride {
-                        acc[i] += (src_row[i] as i64) * wq;
+                        for i in 0..row_stride {
+                            acc[i] += (src_row[i] as i64) * wq;
+                        }
                     }
-                }
 
-                for x in 0..(dst_w as usize) {
-                    let base = x * 4;
-                    dst_row[base] = q_to_u8_from_acc_i64(acc[base]);
-                    dst_row[base + 1] = q_to_u8_from_acc_i64(acc[base + 1]);
-                    dst_row[base + 2] = q_to_u8_from_acc_i64(acc[base + 2]);
-                    dst_row[base + 3] = q_to_u8_from_acc_i64(acc[base + 3]);
-                }
-            });
+                    for x in 0..(dst_w as usize) {
+                        let base = x * 4;
+                        dst_row[base] = q_to_u8_from_acc_i64(acc[base]);
+                        dst_row[base + 1] = q_to_u8_from_acc_i64(acc[base + 1]);
+                        dst_row[base + 2] = q_to_u8_from_acc_i64(acc[base + 2]);
+                        dst_row[base + 3] = q_to_u8_from_acc_i64(acc[base + 3]);
+                    }
+                },
+            );
     }
 
     let out = RgbaImage::from_raw(dst_w, dst_h, out_buf).expect("out buf");
@@ -311,7 +311,10 @@ pub fn resize_lanczos_rgba(
     let taps_total = taps_total_horiz + taps_total_vert;
     let ops_total = taps_total * 8;
 
-    let stats = ResizeStats { taps_total, ops_total };
+    let stats = ResizeStats {
+        taps_total,
+        ops_total,
+    };
     (out, stats)
 }
 

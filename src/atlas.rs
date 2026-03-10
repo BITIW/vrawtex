@@ -1,20 +1,21 @@
 use crate::lanczos;
 use image::RgbaImage;
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
 
 const DEFAULT_MAX_SIDE: u32 = 16384;
+pub const MAX_ATLAS_SIDE: u32 = 22_000;
 const DEFAULT_PAD: u32 = 2;
 
 // edgecost knobs (v1)
-const EDGE_K: u32 = 64;         // signature length
-const EDGE_THICKNESS: u32 = 2;  // average 2px band
-const EDGE_RADIUS_PX: u32 = 5;  // small, fast
+const EDGE_K: u32 = 64; // signature length
+const EDGE_THICKNESS: u32 = 2; // average 2px band
+const EDGE_RADIUS_PX: u32 = 5; // small, fast
 
 #[derive(Clone)]
 struct TexItem {
@@ -33,12 +34,6 @@ struct Placed {
     y: u32,
     w: u32,
     h: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PackResult {
-    side: u32,
-    packed: usize,
 }
 
 fn is_image_ext(p: &Path) -> bool {
@@ -79,8 +74,12 @@ fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(out)
 }
 
-
-fn pack_shelf(order: &[usize], items: &[TexItem], side: u32, pad: u32) -> (Vec<Placed>, Vec<usize>) {
+fn pack_shelf(
+    order: &[usize],
+    items: &[TexItem],
+    side: u32,
+    pad: u32,
+) -> (Vec<Placed>, Vec<usize>) {
     let mut placed = Vec::new();
     let mut remaining = Vec::new();
 
@@ -153,7 +152,10 @@ fn order_area(items: &[TexItem]) -> Vec<usize> {
     idx.sort_by_key(|&i| {
         let it = &items[i];
         // big first
-        (std::cmp::Reverse(it.area), std::cmp::Reverse(it.w.max(it.h)))
+        (
+            std::cmp::Reverse(it.area),
+            std::cmp::Reverse(it.w.max(it.h)),
+        )
     });
     idx
 }
@@ -192,7 +194,6 @@ fn order_edge_greedy_lr(items: &[TexItem]) -> Vec<usize> {
                 }
                 let b = &buckets[q as usize];
 
-
                 let take = b.len().min(64);
                 for &cand in b.iter().rev().take(take) {
                     if used[cand] {
@@ -219,7 +220,6 @@ fn order_edge_greedy_lr(items: &[TexItem]) -> Vec<usize> {
         let next = if let Some(v) = best_i {
             v
         } else {
-
             (0..n).find(|&i| !used[i]).unwrap()
         };
 
@@ -330,29 +330,24 @@ fn order_edge_greedy_bt(items: &[TexItem]) -> Vec<usize> {
 
 fn blit_atlas(side: u32, pad: u32, placements: &[Placed], items: &[TexItem]) -> RgbaImage {
     let mut atlas = RgbaImage::from_pixel(side, side, image::Rgba([0, 0, 0, 0]));
+    let by_id: HashMap<u32, &TexItem> = items.iter().map(|it| (it.id, it)).collect();
 
     for p in placements {
-        let it = items.iter().find(|t| t.id == p.id).expect("id");
+        let it = *by_id.get(&p.id).expect("id");
         let src = it.rgba.as_raw();
 
         let src_w = it.w as usize;
         let src_h = it.h as usize;
         let dst_w = side as usize;
 
-        for row in 0..src_h {
-            let dst_off = ((p.y as usize + row) * dst_w + p.x as usize) * 4;
-            let src_off = row * src_w * 4;
-            let count = src_w * 4;
-
-            // atlas mutable slice
+        {
             let buf: &mut [u8] = atlas.as_flat_samples_mut().samples;
-            let (left, right) = buf.split_at_mut(dst_off);
-            let dst_row = &mut right[..count];
-
-            // src immutable
-            dst_row.copy_from_slice(&src[src_off..src_off + count]);
-
-            drop(left);
+            for row in 0..src_h {
+                let dst_off = ((p.y as usize + row) * dst_w + p.x as usize) * 4;
+                let src_off = row * src_w * 4;
+                let count = src_w * 4;
+                buf[dst_off..dst_off + count].copy_from_slice(&src[src_off..src_off + count]);
+            }
         }
         fill_padding(&mut atlas, side, pad, p);
     }
@@ -374,6 +369,10 @@ fn fill_padding(atlas: &mut RgbaImage, side: u32, pad: u32, p: &Placed) {
     // clamp helpers
     let clamp = |v: i32| v.max(0).min(side_u - 1);
 
+    let side_us = side as usize;
+    let idx = |x: i32, y: i32| ((y as usize) * side_us + (x as usize)) * 4;
+    let buf: &mut [u8] = atlas.as_flat_samples_mut().samples;
+
     // top/bottom pad
     for dy in 1..=pad {
         let sy_top = clamp(y0);
@@ -383,10 +382,15 @@ fn fill_padding(atlas: &mut RgbaImage, side: u32, pad: u32, p: &Placed) {
 
         for x in 0..w {
             let sx = clamp(x0 + x);
-            let c_top = atlas.get_pixel(sx as u32, sy_top as u32).0;
-            let c_bot = atlas.get_pixel(sx as u32, sy_bot as u32).0;
-            atlas.put_pixel(sx as u32, dy_top as u32, image::Rgba(c_top));
-            atlas.put_pixel(sx as u32, dy_bot as u32, image::Rgba(c_bot));
+            let st = idx(sx, sy_top);
+            let sb = idx(sx, sy_bot);
+            let dt = idx(sx, dy_top);
+            let db = idx(sx, dy_bot);
+
+            let c_top = [buf[st], buf[st + 1], buf[st + 2], buf[st + 3]];
+            let c_bot = [buf[sb], buf[sb + 1], buf[sb + 2], buf[sb + 3]];
+            buf[dt..dt + 4].copy_from_slice(&c_top);
+            buf[db..db + 4].copy_from_slice(&c_bot);
         }
     }
 
@@ -399,42 +403,94 @@ fn fill_padding(atlas: &mut RgbaImage, side: u32, pad: u32, p: &Placed) {
 
         for y in 0..h {
             let sy = clamp(y0 + y);
-            let c_l = atlas.get_pixel(sx_left as u32, sy as u32).0;
-            let c_r = atlas.get_pixel(sx_right as u32, sy as u32).0;
-            atlas.put_pixel(dx_left as u32, sy as u32, image::Rgba(c_l));
-            atlas.put_pixel(dx_right as u32, sy as u32, image::Rgba(c_r));
+            let sl = idx(sx_left, sy);
+            let sr = idx(sx_right, sy);
+            let dl = idx(dx_left, sy);
+            let dr = idx(dx_right, sy);
+
+            let c_l = [buf[sl], buf[sl + 1], buf[sl + 2], buf[sl + 3]];
+            let c_r = [buf[sr], buf[sr + 1], buf[sr + 2], buf[sr + 3]];
+            buf[dl..dl + 4].copy_from_slice(&c_l);
+            buf[dr..dr + 4].copy_from_slice(&c_r);
         }
     }
 }
 
 // meta: (pad, vec<(id, rect_u64)>)
-#[derive(Serialize)]
-struct AtlasMeta(u16, Vec<(u32, u64)>);
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AtlasMeta(pub u16, pub Vec<(u32, u64)>);
+
+#[derive(Serialize, Clone, Debug)]
+pub struct AtlasRect {
+    pub id: u32,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
 
 fn pack_rect_u64(x: u16, y: u16, w: u16, h: u16) -> u64 {
     ((x as u64) << 48) | ((y as u64) << 32) | ((w as u64) << 16) | (h as u64)
 }
 
+pub fn unpack_rect_u64(rect: u64) -> (u16, u16, u16, u16) {
+    let x = (rect >> 48) as u16;
+    let y = ((rect >> 32) & 0xFFFF) as u16;
+    let w = ((rect >> 16) & 0xFFFF) as u16;
+    let h = (rect & 0xFFFF) as u16;
+    (x, y, w, h)
+}
+
+pub fn decode_meta(bytes: &[u8]) -> Result<AtlasMeta, Box<dyn Error>> {
+    let meta: AtlasMeta = rmp_serde::from_slice(bytes)?;
+    Ok(meta)
+}
+
+pub fn meta_rects(meta: &AtlasMeta) -> Vec<AtlasRect> {
+    meta.1
+        .iter()
+        .map(|(id, rect)| {
+            let (x, y, w, h) = unpack_rect_u64(*rect);
+            AtlasRect {
+                id: *id,
+                x,
+                y,
+                w,
+                h,
+            }
+        })
+        .collect()
+}
+
 fn make_meta(pad: u32, placements: &[Placed]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let pad_u16 = u16::try_from(pad).map_err(|_| "atlas meta overflow: pad does not fit u16")?;
     let mut v = Vec::with_capacity(placements.len());
     for p in placements {
-        let x = p.x as u16;
-        let y = p.y as u16;
-        let w = p.w as u16;
-        let h = p.h as u16;
+        let x = u16::try_from(p.x).map_err(|_| "atlas meta overflow: x does not fit u16")?;
+        let y = u16::try_from(p.y).map_err(|_| "atlas meta overflow: y does not fit u16")?;
+        let w = u16::try_from(p.w).map_err(|_| "atlas meta overflow: w does not fit u16")?;
+        let h = u16::try_from(p.h).map_err(|_| "atlas meta overflow: h does not fit u16")?;
         let rect = pack_rect_u64(x, y, w, h);
         v.push((p.id, rect));
     }
 
-    let meta = AtlasMeta(pad as u16, v);
+    let meta = AtlasMeta(pad_u16, v);
     let bytes = rmp_serde::to_vec(&meta)?;
     Ok(bytes)
 }
 
 fn output_path_for_chunk(base: &Path, chunk: usize) -> PathBuf {
     let mut p = base.to_path_buf();
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("vrawtex").to_string();
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("atlas").to_string();
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("vrawtex")
+        .to_string();
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("atlas")
+        .to_string();
     p.set_file_name(format!("{stem}_{chunk}.{ext}"));
     p
 }
@@ -449,6 +505,14 @@ pub fn atlas_cmd(
     let max_side = max_side.unwrap_or(DEFAULT_MAX_SIDE);
     let pad = pad.unwrap_or(DEFAULT_PAD);
     let out_base = output.unwrap_or_else(|| PathBuf::from("./atlas.vrawtex"));
+
+    if max_side > MAX_ATLAS_SIDE {
+        return Err(format!(
+            "atlas: max-side {} exceeds supported limit {}",
+            max_side, MAX_ATLAS_SIDE
+        )
+        .into());
+    }
 
     if verbose {
         println!(
@@ -470,13 +534,15 @@ pub fn atlas_cmd(
     }
 
     let t_load = Instant::now();
-    let items: Vec<TexItem> = paths
+    let load_results: Vec<Result<TexItem, String>> = paths
         .par_iter()
-        .filter_map(|p| {
-            let img = image::open(p).ok()?.to_rgba8();
+        .map(|p| {
+            let img = image::open(p)
+                .map_err(|e| format!("{}: {e}", p.display()))?
+                .to_rgba8();
             let (w, h) = img.dimensions();
             let sig = lanczos::edge_signature(&img, EDGE_K, EDGE_THICKNESS, EDGE_RADIUS_PX);
-            Some(TexItem {
+            Ok(TexItem {
                 id: 0,
                 w,
                 h,
@@ -484,6 +550,18 @@ pub fn atlas_cmd(
                 sig,
                 area: w as u64 * h as u64,
             })
+        })
+        .collect();
+
+    let mut load_errors: Vec<String> = Vec::new();
+    let items: Vec<TexItem> = load_results
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                load_errors.push(e);
+                None
+            }
         })
         .collect();
 
@@ -495,6 +573,25 @@ pub fn atlas_cmd(
             it
         })
         .collect();
+
+    if !load_errors.is_empty() {
+        eprintln!(
+            "[vrawtex] atlas: skipped {} image(s) due to load errors",
+            load_errors.len()
+        );
+        if verbose {
+            for msg in load_errors.iter().take(20) {
+                eprintln!("  {msg}");
+            }
+            if load_errors.len() > 20 {
+                eprintln!("  ... and {} more", load_errors.len() - 20);
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return Err("atlas: failed to load any input image".into());
+    }
 
     if verbose {
         println!(
@@ -517,27 +614,17 @@ pub fn atlas_cmd(
 
         // candidates: order variants
         let ord0 = order_area(&items);
-        let ord1 = order_edge_greedy_lr(&items);
-        let ord2 = order_edge_greedy_bt(&items);
 
         // first: pack as many as possible at max_side using ord0 (baseline split)
         let (placed0, rem0) = pack_shelf(&ord0, &items, max_side, pad);
         if placed0.is_empty() {
             return Err("atlas: cannot pack even 1 texture into max_side (too big?)".into());
         }
-        // determine which indices are packed
-        let mut packed_flags = vec![false; items.len()];
-        for p in &placed0 {
-            let idx = p.id as usize; // id == index for current chunk list, because we renumber each loop?
-            // not guaranteed after removals, so do safer mapping by scan:
-            // We'll map by id -> position in items:
-            let _ = idx;
-        }
         let mut chunk_items = Vec::with_capacity(placed0.len());
         let mut rest_items = Vec::with_capacity(rem0.len());
 
         // build a set of placed ids
-        let mut placed_ids = std::collections::HashSet::with_capacity(placed0.len());
+        let mut placed_ids = HashSet::with_capacity(placed0.len());
         for p in &placed0 {
             placed_ids.insert(p.id);
         }
@@ -589,12 +676,12 @@ pub fn atlas_cmd(
 
             // test encode size (важно: это твой же encoder, только в Vec)
             let test = crate::encode_rgba8_with_meta_to_vec(
-                                                                    &atlas_img,
-                                                                    Some(&meta),
-                                                                    false, // verbose для теста
-                                                                    None,
-                                                                    std::time::Instant::now(),
-                                                                    )?;
+                &atlas_img,
+                Some(&meta),
+                false, // verbose для теста
+                None,
+                std::time::Instant::now(),
+            )?;
             let test_size = test.len() as u64;
 
             if verbose {
@@ -618,7 +705,8 @@ pub fn atlas_cmd(
             }
         }
 
-        let (best_id, best_side, best_size, best_pl) = best.ok_or("atlas: all candidates failed to pack")?;
+        let (best_id, best_side, best_size, best_pl) =
+            best.ok_or("atlas: all candidates failed to pack")?;
 
         // Build final atlas + meta and encode to file
         let atlas_img = blit_atlas(best_side, pad, &best_pl, &chunk_items);
