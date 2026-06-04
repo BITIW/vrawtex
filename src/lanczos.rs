@@ -116,8 +116,7 @@ pub struct ResizeStats {
 }
 
 /// build kernels for 1D resample, radius_px = "a"
-fn build_kernels_1d(src_len: u32, dst_len: u32, radius_px: u32) -> Vec<Kernel1D> {
-    let radius_q = fixed_from_int(radius_px as i64);
+fn build_kernels_1d(src_len: u32, dst_len: u32, radius_q: Fixed) -> Vec<Kernel1D> {
     let scale_q: Fixed = ((src_len as i64) << FRAC_BITS) / (dst_len as i64);
 
     (0..dst_len)
@@ -131,17 +130,15 @@ fn build_kernels_1d(src_len: u32, dst_len: u32, radius_px: u32) -> Vec<Kernel1D>
 
             let left_q = center_q - radius_q;
             let right_q = center_q + radius_q;
-            let left = (left_q >> FRAC_BITS) as i32;
-            let right = (right_q >> FRAC_BITS) as i32;
+            let left = ((left_q >> FRAC_BITS).max(0) as u32).min(src_len - 1);
+            let right = ((right_q >> FRAC_BITS).max(0) as u32).min(src_len - 1);
 
-            let mut indices = Vec::new();
-            let mut weights_tmp = Vec::new();
+            let capacity = right.saturating_sub(left) as usize + 1;
+            let mut indices = Vec::with_capacity(capacity);
+            let mut weights_tmp = Vec::with_capacity(capacity);
             let mut sum_w: i128 = 0;
 
             for src_i in left..=right {
-                if src_i < 0 || src_i >= src_len as i32 {
-                    continue;
-                }
                 let src_q = (src_i as i64) << FRAC_BITS;
                 let mut dist_q = center_q - src_q;
                 if dist_q < 0 {
@@ -155,7 +152,7 @@ fn build_kernels_1d(src_len: u32, dst_len: u32, radius_px: u32) -> Vec<Kernel1D>
                 if w_q == 0 {
                     continue;
                 }
-                indices.push(src_i as u32);
+                indices.push(src_i);
                 weights_tmp.push(w_q);
                 sum_w += w_q as i128;
             }
@@ -185,7 +182,7 @@ pub fn resample_1d_rgb(src_rgb: &[u8], src_len: u32, dst_len: u32, radius_px: u3
         return src_rgb.to_vec();
     }
 
-    let kernels = build_kernels_1d(src_len, dst_len, radius_px);
+    let kernels = build_kernels_1d(src_len, dst_len, fixed_from_int(radius_px as i64));
     let mut out = vec![0u8; dst_len as usize * 3];
 
     out.par_chunks_mut(3).enumerate().for_each(|(dx, pix)| {
@@ -210,19 +207,48 @@ pub fn resample_1d_rgb(src_rgb: &[u8], src_len: u32, dst_len: u32, radius_px: u3
     out
 }
 
-/// Полный 2D Lanczos RGBA
-/// radius_px — фиксированная "ручка" в пикселях
-pub fn resize_lanczos_rgba(
+fn radius_percent_q(src_w: u32, src_h: u32, radius_percent: u32) -> Fixed {
+    let radius_frac_q: Fixed = (((radius_percent as i128) << FRAC_BITS) / 100i128) as Fixed;
+    fixed_mul(
+        fixed_from_int(src_w.min(src_h).max(1) as i64),
+        radius_frac_q,
+    )
+    .max(ONE)
+}
+
+/// Полный 2D Lanczos RGBA с радиусом в процентах от меньшей стороны source.
+pub fn resize_lanczos_rgba_percent(
     src: &RgbaImage,
     dst_w: u32,
     dst_h: u32,
-    radius_px: u32,
+    radius_percent: u32,
 ) -> (RgbaImage, ResizeStats) {
     let (src_w, src_h) = src.dimensions();
+    let radius_q = radius_percent_q(src_w, src_h, radius_percent.max(1));
+    resize_lanczos_rgba_fixed(src, dst_w, dst_h, radius_q)
+}
+
+fn resize_lanczos_rgba_fixed(
+    src: &RgbaImage,
+    dst_w: u32,
+    dst_h: u32,
+    radius_q: Fixed,
+) -> (RgbaImage, ResizeStats) {
+    let (src_w, src_h) = src.dimensions();
+    assert!(src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0);
+    if src_w == dst_w && src_h == dst_h {
+        return (
+            src.clone(),
+            ResizeStats {
+                taps_total: 0,
+                ops_total: 0,
+            },
+        );
+    }
     let src_buf = src.as_raw();
 
     // ----- Horizontal -----
-    let kernels_x = build_kernels_1d(src_w, dst_w, radius_px);
+    let kernels_x = build_kernels_1d(src_w, dst_w, radius_q);
     let taps_x_per_row: u64 = kernels_x.iter().map(|k| k.weights_q.len() as u64).sum();
 
     let mut tmp_buf = vec![0u8; dst_w as usize * src_h as usize * 4];
@@ -238,9 +264,7 @@ pub fn resize_lanczos_rgba(
                 let src_row_start = row * row_stride_src;
                 let src_row = &src_buf[src_row_start..src_row_start + row_stride_src];
 
-                for x in 0..(dst_row.len() / 4) {
-                    let k = &kernels_x[x];
-
+                for (x, k) in kernels_x.iter().enumerate() {
                     let mut acc_r: i64 = 0;
                     let mut acc_g: i64 = 0;
                     let mut acc_b: i64 = 0;
@@ -267,7 +291,7 @@ pub fn resize_lanczos_rgba(
 
     // ----- Vertical -----
     let tmp_buf = tmp.into_raw();
-    let kernels_y = build_kernels_1d(src_h, dst_h, radius_px);
+    let kernels_y = build_kernels_1d(src_h, dst_h, radius_q);
     let taps_y_per_col: u64 = kernels_y.iter().map(|k| k.weights_q.len() as u64).sum();
 
     let mut out_buf = vec![0u8; dst_w as usize * dst_h as usize * 4];
@@ -288,17 +312,16 @@ pub fn resize_lanczos_rgba(
                         let src_off = src_y as usize * row_stride;
                         let src_row = &tmp_buf[src_off..src_off + row_stride];
 
-                        for i in 0..row_stride {
-                            acc[i] += (src_row[i] as i64) * wq;
+                        for (sum, &sample) in acc.iter_mut().zip(src_row.iter()) {
+                            *sum += (sample as i64) * wq;
                         }
                     }
 
-                    for x in 0..(dst_w as usize) {
-                        let base = x * 4;
-                        dst_row[base] = q_to_u8_from_acc_i64(acc[base]);
-                        dst_row[base + 1] = q_to_u8_from_acc_i64(acc[base + 1]);
-                        dst_row[base + 2] = q_to_u8_from_acc_i64(acc[base + 2]);
-                        dst_row[base + 3] = q_to_u8_from_acc_i64(acc[base + 3]);
+                    for (dst_pixel, sums) in dst_row.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                        dst_pixel[0] = q_to_u8_from_acc_i64(sums[0]);
+                        dst_pixel[1] = q_to_u8_from_acc_i64(sums[1]);
+                        dst_pixel[2] = q_to_u8_from_acc_i64(sums[2]);
+                        dst_pixel[3] = q_to_u8_from_acc_i64(sums[3]);
                     }
                 },
             );
@@ -476,23 +499,4 @@ pub fn edge_mismatch_bt(a: &EdgeSig, b: &EdgeSig) -> u32 {
         s += da.unsigned_abs();
     }
     s
-}
-
-/// Подготовка под mipchain: scales_percent = [100, 75, 50, 25] и т.п.
-pub fn build_mipchain_percent(
-    src: &RgbaImage,
-    scales_percent: &[u32],
-    radius_px: u32,
-) -> Vec<RgbaImage> {
-    let (w, h) = src.dimensions();
-    let mut out = Vec::new();
-
-    for &p in scales_percent {
-        let p = p.max(1);
-        let dw = ((w as u64 * p as u64) / 100).max(1) as u32;
-        let dh = ((h as u64 * p as u64) / 100).max(1) as u32;
-        let (img, _st) = resize_lanczos_rgba(src, dw, dh, radius_px);
-        out.push(img);
-    }
-    out
 }

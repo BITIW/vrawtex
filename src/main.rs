@@ -1,11 +1,15 @@
 mod atlas;
+mod image_input;
 mod lanczos;
+mod mipchain;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use image::{ColorType, GenericImageView, RgbaImage};
-use minifb::{Key, Window, WindowOptions};
+use image::{ColorType, RgbaImage};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,13 +20,19 @@ use zstd::{bulk, stream::Encoder};
 
 const MAX_WINDOW_WIDTH: usize = 1920;
 const MAX_WINDOW_HEIGHT: usize = 1080;
+const VIEWER_MAX_SCALE: f64 = 8.0;
+const VIEWER_MIN_SCALE: f64 = 0.01;
+const VIEWER_ZOOM_STEP: f64 = 1.20;
+const VIEWER_KEY_PAN_PIXELS: f64 = 80.0;
 
 const ZSTD_LEVEL: i32 = 10;
 const AUTO_SELECT_ZSTD_LEVEL: i32 = 3;
 const ZSTD_WORKERS_TOTAL: u32 = 8;
 const CHUNK_TARGET: usize = 128 * 1024;
+const PLANE_PAR_CHUNK: usize = 256 * 1024;
 const PREDICTOR_SAMPLE_BYTES: usize = 256 * 1024;
 const PREDICTOR_NONE_MIN_GAIN_BPS: u64 = 200; // 2.00%
+const PREDICTOR_EXPENSIVE_MIN_GAIN_BPS: u64 = 800; // 8.00%
 const COLOR_TRANSFORM_MIN_GAIN_BPS: u64 = 50; // 0.50%
 
 const FILE_MAGIC: [u8; 4] = *b"VRTX";
@@ -50,6 +60,8 @@ enum AlphaMode {
 enum ColorTransform {
     None = 0,
     SubGreen = 1,
+    SubRed = 2,
+    SubBlue = 3,
 }
 
 impl ColorTransform {
@@ -57,6 +69,8 @@ impl ColorTransform {
         match v {
             0 => Ok(ColorTransform::None),
             1 => Ok(ColorTransform::SubGreen),
+            2 => Ok(ColorTransform::SubRed),
+            3 => Ok(ColorTransform::SubBlue),
             _ => Err(format!("unsupported color transform id: {v}").into()),
         }
     }
@@ -65,6 +79,8 @@ impl ColorTransform {
         match self {
             ColorTransform::None => "none",
             ColorTransform::SubGreen => "subgreen",
+            ColorTransform::SubRed => "subred",
+            ColorTransform::SubBlue => "subblue",
         }
     }
 }
@@ -79,6 +95,28 @@ enum DecodeSafety {
 enum ContainerFormat {
     V1,
     Legacy,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EncodePixelFormat {
+    Rgba8,
+    Rgb8,
+}
+
+impl EncodePixelFormat {
+    fn channels(self) -> u8 {
+        match self {
+            EncodePixelFormat::Rgba8 => 4,
+            EncodePixelFormat::Rgb8 => 3,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            EncodePixelFormat::Rgba8 => "RGBA8",
+            EncodePixelFormat::Rgb8 => "RGB8",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -115,6 +153,10 @@ impl Predictor {
     }
 
     fn needs_scratch(self) -> bool {
+        matches!(self, Predictor::Up | Predictor::Paeth)
+    }
+
+    fn is_expensive(self) -> bool {
         self == Predictor::Paeth
     }
 
@@ -136,14 +178,31 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_mipchain_args(std::env::args_os()));
 
     match cli.command {
         Command::Encode {
             input,
             output,
             recursive,
-        } => encode_cmd(input, output, recursive, cli.verbose),
+            rgb8,
+            mipchain,
+            size,
+        } => {
+            let mipchain = mipchain::MipChainSpec::from_cli(mipchain, size)?;
+            encode_cmd(
+                input,
+                output,
+                recursive,
+                mipchain,
+                if rgb8 {
+                    EncodePixelFormat::Rgb8
+                } else {
+                    EncodePixelFormat::Rgba8
+                },
+                cli.verbose,
+            )
+        }
 
         Command::Decode {
             input,
@@ -166,13 +225,60 @@ fn run() -> Result<(), Box<dyn Error>> {
             output,
             max_side,
             pad,
+            rgb8,
+            mipchain,
+            size,
+            minecraft,
         } => {
             if inputs.is_empty() {
                 return Err("atlas: need at least one INPUT (file or directory)".into());
             }
-            atlas::atlas_cmd(inputs, output, max_side, pad, cli.verbose)
+            if minecraft && rgb8 {
+                return Err(
+                    "atlas --minecraft cannot use --rgb8 because Minecraft textures require alpha"
+                        .into(),
+                );
+            }
+            if minecraft && mipchain.is_some() {
+                return Err(
+                    "atlas --minecraft cannot use --mipchain yet: animated texture strips must be resized frame-by-frame"
+                        .into(),
+                );
+            }
+            let mipchain = mipchain::MipChainSpec::from_cli(mipchain, size)?;
+            atlas::atlas_cmd(
+                inputs,
+                output,
+                max_side,
+                pad,
+                mipchain,
+                if rgb8 {
+                    EncodePixelFormat::Rgb8
+                } else {
+                    EncodePixelFormat::Rgba8
+                },
+                minecraft,
+                cli.verbose,
+            )
         }
     }
+}
+
+fn normalize_mipchain_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    for index in 1..args.len() {
+        if args[index] != "--mipchain" {
+            continue;
+        }
+        let next_is_level_count = args
+            .get(index + 1)
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.parse::<usize>().is_ok());
+        if !next_is_level_count {
+            args[index] = OsString::from("--mipchain=0");
+        }
+    }
+    args
 }
 
 #[derive(Parser)]
@@ -203,6 +309,18 @@ enum Command {
         /// If input is a directory: process it recursively into sibling VRAWTEXed/
         #[arg(short = 'r', long = "recursive")]
         recursive: bool,
+
+        /// Store RGB8 and discard alpha
+        #[arg(long = "rgb8")]
+        rgb8: bool,
+
+        /// Build mipchain; optional value limits additional levels after mip0
+        #[arg(long = "mipchain", num_args = 0..=1, default_missing_value = "0", value_name = "LEVELS")]
+        mipchain: Option<usize>,
+
+        /// Exact mip heights after mip0, comma-separated
+        #[arg(long = "size", value_delimiter = ',', value_name = "HEIGHTS")]
+        size: Vec<u32>,
     },
 
     /// Decode .vrawtex into RAW or PNG
@@ -221,7 +339,7 @@ enum Command {
         #[arg(long = "safety", value_enum, default_value_t = DecodeSafety::Strict)]
         safety: DecodeSafety,
 
-        /// Optional JSON output path for parsed atlas metadata.
+        /// Optional JSON output path for recognized metadata.
         #[arg(long = "dump-meta")]
         dump_meta: Option<PathBuf>,
     },
@@ -245,7 +363,7 @@ enum Command {
         #[arg(long = "safety", value_enum, default_value_t = DecodeSafety::Strict)]
         safety: DecodeSafety,
 
-        /// Optional JSON output path for parsed atlas metadata.
+        /// Optional JSON output path for recognized metadata.
         #[arg(long = "dump-meta")]
         dump_meta: Option<PathBuf>,
     },
@@ -267,6 +385,22 @@ enum Command {
         /// Padding pixels around each texture (default 2)
         #[arg(long = "pad")]
         pad: Option<u32>,
+
+        /// Store RGB8 and discard alpha
+        #[arg(long = "rgb8")]
+        rgb8: bool,
+
+        /// Emit atlas_mip0, atlas_mip1, ...; optional value limits levels after mip0
+        #[arg(long = "mipchain", num_args = 0..=1, default_missing_value = "0", value_name = "LEVELS")]
+        mipchain: Option<usize>,
+
+        /// Exact atlas mip side lengths, comma-separated
+        #[arg(long = "size", value_delimiter = ',', value_name = "HEIGHTS")]
+        size: Vec<u32>,
+
+        /// Pack one Minecraft resource-pack root and preserve resource locations/.mcmeta
+        #[arg(long = "minecraft")]
+        minecraft: bool,
     },
 }
 
@@ -308,12 +442,12 @@ fn human_mb(bytes: u64) -> String {
 }
 
 fn channel_name(idx: usize, chans: u8) -> String {
-    if chans == 4 {
+    if chans >= 3 {
         match idx {
             0 => "R".to_string(),
             1 => "G".to_string(),
             2 => "B".to_string(),
-            3 => "A".to_string(),
+            3 if chans == 4 => "A".to_string(),
             _ => format!("C{}", idx),
         }
     } else {
@@ -395,6 +529,37 @@ fn deinterleave_rgba_row_to_planar(
     }
 }
 
+/// RGBA input row -> RGB planar rows without touching discarded alpha.
+fn deinterleave_rgba_row_to_rgb_planar(
+    row_rgba: &[u8],
+    dst_r: &mut [u8],
+    dst_g: &mut [u8],
+    dst_b: &mut [u8],
+) {
+    let len = dst_r.len();
+    debug_assert_eq!(dst_g.len(), len);
+    debug_assert_eq!(dst_b.len(), len);
+    debug_assert_eq!(row_rgba.len(), len * 4);
+
+    unsafe {
+        let mut src = row_rgba.as_ptr();
+        let mut pr = dst_r.as_mut_ptr();
+        let mut pg = dst_g.as_mut_ptr();
+        let mut pb = dst_b.as_mut_ptr();
+
+        for _ in 0..len {
+            *pr = *src;
+            *pg = *src.add(1);
+            *pb = *src.add(2);
+
+            src = src.add(4);
+            pr = pr.add(1);
+            pg = pg.add(1);
+            pb = pb.add(1);
+        }
+    }
+}
+
 /// SIMD-friendly: 4 planar planes -> RGBA interleaved
 fn interleave_planar_rgba(planes: &[Vec<u8>], out: &mut [u8]) {
     assert!(planes.len() >= 4);
@@ -449,6 +614,20 @@ fn apply_color_transform_inplace(
                 row_b[i] = row_b[i].wrapping_sub(g);
             }
         }
+        ColorTransform::SubRed => {
+            for i in 0..row_r.len() {
+                let r = row_r[i];
+                row_g[i] = row_g[i].wrapping_sub(r);
+                row_b[i] = row_b[i].wrapping_sub(r);
+            }
+        }
+        ColorTransform::SubBlue => {
+            for i in 0..row_r.len() {
+                let b = row_b[i];
+                row_r[i] = row_r[i].wrapping_sub(b);
+                row_g[i] = row_g[i].wrapping_sub(b);
+            }
+        }
     }
 }
 
@@ -466,7 +645,7 @@ fn inverse_color_transform_rgb_planes_inplace(
     let (r_planes, gb_planes) = planes.split_at_mut(1);
     let row_r = &mut r_planes[0];
     let (g_planes, b_planes) = gb_planes.split_at_mut(1);
-    let row_g = &g_planes[0];
+    let row_g = &mut g_planes[0];
     let row_b = &mut b_planes[0];
 
     if row_r.len() != row_g.len() || row_r.len() != row_b.len() {
@@ -476,11 +655,43 @@ fn inverse_color_transform_rgb_planes_inplace(
     match transform {
         ColorTransform::None => {}
         ColorTransform::SubGreen => {
-            for i in 0..row_r.len() {
-                let g = row_g[i];
-                row_r[i] = row_r[i].wrapping_add(g);
-                row_b[i] = row_b[i].wrapping_add(g);
-            }
+            row_r
+                .par_chunks_mut(PLANE_PAR_CHUNK)
+                .zip(row_g.par_chunks(PLANE_PAR_CHUNK))
+                .zip(row_b.par_chunks_mut(PLANE_PAR_CHUNK))
+                .for_each(|((r, g), b)| {
+                    for i in 0..r.len() {
+                        let g = g[i];
+                        r[i] = r[i].wrapping_add(g);
+                        b[i] = b[i].wrapping_add(g);
+                    }
+                });
+        }
+        ColorTransform::SubRed => {
+            row_r
+                .par_chunks(PLANE_PAR_CHUNK)
+                .zip(row_g.par_chunks_mut(PLANE_PAR_CHUNK))
+                .zip(row_b.par_chunks_mut(PLANE_PAR_CHUNK))
+                .for_each(|((r, g), b)| {
+                    for i in 0..r.len() {
+                        let r = r[i];
+                        g[i] = g[i].wrapping_add(r);
+                        b[i] = b[i].wrapping_add(r);
+                    }
+                });
+        }
+        ColorTransform::SubBlue => {
+            row_r
+                .par_chunks_mut(PLANE_PAR_CHUNK)
+                .zip(row_g.par_chunks_mut(PLANE_PAR_CHUNK))
+                .zip(row_b.par_chunks(PLANE_PAR_CHUNK))
+                .for_each(|((r, g), b)| {
+                    for i in 0..r.len() {
+                        let b = b[i];
+                        r[i] = r[i].wrapping_add(b);
+                        g[i] = g[i].wrapping_add(b);
+                    }
+                });
         }
     }
 
@@ -529,6 +740,58 @@ fn extract_transformed_channel_row(
                 out[x] = row_rgba[x * 4 + 3];
             }
         }
+        (ColorTransform::SubRed, 0) => {
+            for x in 0..width {
+                out[x] = row_rgba[x * 4];
+            }
+        }
+        (ColorTransform::SubRed, 1) => {
+            for x in 0..width {
+                let base = x * 4;
+                let g = row_rgba[base + 1];
+                let r = row_rgba[base];
+                out[x] = g.wrapping_sub(r);
+            }
+        }
+        (ColorTransform::SubRed, 2) => {
+            for x in 0..width {
+                let base = x * 4;
+                let b = row_rgba[base + 2];
+                let r = row_rgba[base];
+                out[x] = b.wrapping_sub(r);
+            }
+        }
+        (ColorTransform::SubRed, 3) => {
+            for x in 0..width {
+                out[x] = row_rgba[x * 4 + 3];
+            }
+        }
+        (ColorTransform::SubBlue, 0) => {
+            for x in 0..width {
+                let base = x * 4;
+                let r = row_rgba[base];
+                let b = row_rgba[base + 2];
+                out[x] = r.wrapping_sub(b);
+            }
+        }
+        (ColorTransform::SubBlue, 1) => {
+            for x in 0..width {
+                let base = x * 4;
+                let g = row_rgba[base + 1];
+                let b = row_rgba[base + 2];
+                out[x] = g.wrapping_sub(b);
+            }
+        }
+        (ColorTransform::SubBlue, 2) => {
+            for x in 0..width {
+                out[x] = row_rgba[x * 4 + 2];
+            }
+        }
+        (ColorTransform::SubBlue, 3) => {
+            for x in 0..width {
+                out[x] = row_rgba[x * 4 + 3];
+            }
+        }
         _ => {}
     }
 }
@@ -571,36 +834,41 @@ fn up_encode_row(src: &[u8], prev_row: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
     debug_assert_eq!(src.len(), prev_row.len());
 
-    for i in 0..src.len() {
-        dst[i] = src[i].wrapping_sub(prev_row[i]);
-    }
-}
-
-fn up_encode_row_inplace(row: &mut [u8], prev_row: &[u8]) {
-    debug_assert_eq!(row.len(), prev_row.len());
-
-    for i in 0..row.len() {
-        row[i] = row[i].wrapping_sub(prev_row[i]);
+    unsafe {
+        let mut src_ptr = src.as_ptr();
+        let mut prev_ptr = prev_row.as_ptr();
+        let mut dst_ptr = dst.as_mut_ptr();
+        for _ in 0..src.len() {
+            *dst_ptr = (*src_ptr).wrapping_sub(*prev_ptr);
+            src_ptr = src_ptr.add(1);
+            prev_ptr = prev_ptr.add(1);
+            dst_ptr = dst_ptr.add(1);
+        }
     }
 }
 
 fn up_decode_row_inplace(row: &mut [u8], prev_row: &[u8]) {
     debug_assert_eq!(row.len(), prev_row.len());
 
-    for i in 0..row.len() {
-        row[i] = row[i].wrapping_add(prev_row[i]);
+    unsafe {
+        let mut row_ptr = row.as_mut_ptr();
+        let mut prev_ptr = prev_row.as_ptr();
+        for _ in 0..row.len() {
+            *row_ptr = (*row_ptr).wrapping_add(*prev_ptr);
+            row_ptr = row_ptr.add(1);
+            prev_ptr = prev_ptr.add(1);
+        }
     }
 }
 
 #[inline(always)]
 fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-    let a = a as i32;
-    let b = b as i32;
-    let c = c as i32;
-    let p = a + b - c;
-    let pa = (p - a).unsigned_abs();
-    let pb = (p - b).unsigned_abs();
-    let pc = (p - c).unsigned_abs();
+    let a = a as i16;
+    let b = b as i16;
+    let c = c as i16;
+    let pa = (b - c).abs();
+    let pb = (a - c).abs();
+    let pc = (a + b - (c << 1)).abs();
 
     if pa <= pb && pa <= pc {
         a as u8
@@ -615,22 +883,53 @@ fn paeth_encode_row(src: &[u8], prev_row: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
     debug_assert_eq!(src.len(), prev_row.len());
 
-    for i in 0..src.len() {
-        let a = if i == 0 { 0 } else { src[i - 1] };
-        let b = prev_row[i];
-        let c = if i == 0 { 0 } else { prev_row[i - 1] };
-        dst[i] = src[i].wrapping_sub(paeth_predictor(a, b, c));
+    if src.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let src_ptr = src.as_ptr();
+        let prev_ptr = prev_row.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
+
+        *dst_ptr = (*src_ptr).wrapping_sub(*prev_ptr);
+        let mut left = *src_ptr;
+        let mut prev_left = *prev_ptr;
+
+        for i in 1..src.len() {
+            let cur = *src_ptr.add(i);
+            let up = *prev_ptr.add(i);
+            let pred = paeth_predictor(left, up, prev_left);
+            *dst_ptr.add(i) = cur.wrapping_sub(pred);
+            left = cur;
+            prev_left = up;
+        }
     }
 }
 
 fn paeth_decode_row_inplace(row: &mut [u8], prev_row: &[u8]) {
     debug_assert_eq!(row.len(), prev_row.len());
 
-    for i in 0..row.len() {
-        let a = if i == 0 { 0 } else { row[i - 1] };
-        let b = prev_row[i];
-        let c = if i == 0 { 0 } else { prev_row[i - 1] };
-        row[i] = row[i].wrapping_add(paeth_predictor(a, b, c));
+    if row.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let row_ptr = row.as_mut_ptr();
+        let prev_ptr = prev_row.as_ptr();
+
+        let mut left = (*row_ptr).wrapping_add(*prev_ptr);
+        *row_ptr = left;
+        let mut prev_left = *prev_ptr;
+
+        for i in 1..row.len() {
+            let up = *prev_ptr.add(i);
+            let pred = paeth_predictor(left, up, prev_left);
+            let decoded = (*row_ptr.add(i)).wrapping_add(pred);
+            *row_ptr.add(i) = decoded;
+            left = decoded;
+            prev_left = up;
+        }
     }
 }
 
@@ -652,7 +951,7 @@ fn append_predicted_row(
     row: &mut [u8],
     prev_row: &[u8],
     predictor: Predictor,
-    paeth_scratch: &mut [u8],
+    scratch: &mut [u8],
     out: &mut Vec<u8>,
 ) {
     match predictor {
@@ -662,12 +961,12 @@ fn append_predicted_row(
             out.extend_from_slice(row);
         }
         Predictor::Up => {
-            up_encode_row_inplace(row, prev_row);
-            out.extend_from_slice(row);
+            encode_row_with_predictor(row, prev_row, predictor, scratch);
+            out.extend_from_slice(scratch);
         }
         Predictor::Paeth => {
-            encode_row_with_predictor(row, prev_row, predictor, paeth_scratch);
-            out.extend_from_slice(paeth_scratch);
+            encode_row_with_predictor(row, prev_row, predictor, scratch);
+            out.extend_from_slice(scratch);
         }
     }
 }
@@ -973,9 +1272,9 @@ fn parse_container(data: &[u8], safety: DecodeSafety) -> Result<ParsedContainer,
     };
 
     let packed_alpha_size = (pixels + 7) / 8;
-    let store_alpha_stream =
-        !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
-    let stored_streams = if store_alpha_stream { 4usize } else { 3usize };
+    let store_alpha_stream = chans == 4
+        && !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
+    let stored_streams = 3usize + usize::from(store_alpha_stream);
     let mut expected_sizes = vec![plane_size; stored_streams];
     if store_alpha_stream && alpha_mode == AlphaMode::Mask1Bit {
         expected_sizes[3] = packed_alpha_size;
@@ -1084,30 +1383,44 @@ fn read_streams(
     let (headers, final_offset) =
         read_stream_headers(data, offset, expected_sizes, format, legacy_predictors)?;
 
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-    let mut comp_sizes: Vec<u64> = Vec::with_capacity(headers.len());
-    let mut predictors: Vec<Predictor> = Vec::with_capacity(headers.len());
+    let decoded = headers
+        .par_iter()
+        .enumerate()
+        .map(
+            |(idx, hdr)| -> Result<(usize, Vec<u8>, u64, Predictor), String> {
+                if hdr.orig_size > usize::MAX as u64 {
+                    return Err("stream orig_size too large for this build".to_string());
+                }
+                let cs = hdr.comp_size as usize;
+                let comp_slice = &data[hdr.data_offset..hdr.data_offset + cs];
 
-    for hdr in &headers {
-        if hdr.orig_size > usize::MAX as u64 {
-            return Err("stream orig_size too large for this build".into());
-        }
-        let cs = hdr.comp_size as usize;
-        let comp_slice = &data[hdr.data_offset..hdr.data_offset + cs];
+                let decompressed = bulk::decompress(comp_slice, hdr.orig_size as usize)
+                    .map_err(|e| e.to_string())?;
+                if decompressed.len() != hdr.orig_size as usize {
+                    return Err(format!(
+                        "decompressed size mismatch: expected {}, got {}",
+                        hdr.orig_size,
+                        decompressed.len()
+                    ));
+                }
 
-        let decompressed = bulk::decompress(comp_slice, hdr.orig_size as usize)?;
-        if decompressed.len() != hdr.orig_size as usize {
-            return Err(format!(
-                "decompressed size mismatch: expected {}, got {}",
-                hdr.orig_size,
-                decompressed.len()
-            )
-            .into());
-        }
+                Ok((idx, decompressed, hdr.comp_size, hdr.predictor))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
-        planes.push(decompressed);
-        comp_sizes.push(hdr.comp_size);
-        predictors.push(hdr.predictor);
+    let mut decoded = decoded;
+    decoded.sort_by_key(|(idx, _, _, _)| *idx);
+
+    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(decoded.len());
+    let mut comp_sizes: Vec<u64> = Vec::with_capacity(decoded.len());
+    let mut predictors: Vec<Predictor> = Vec::with_capacity(decoded.len());
+
+    for (_, plane, comp_size, predictor) in decoded {
+        planes.push(plane);
+        comp_sizes.push(comp_size);
+        predictors.push(predictor);
     }
 
     Ok((planes, comp_sizes, predictors, final_offset))
@@ -1116,6 +1429,16 @@ fn read_streams(
 fn parse_atlas_meta(meta_raw: Option<&[u8]>) -> Option<atlas::AtlasMeta> {
     let bytes = meta_raw?;
     atlas::decode_meta(bytes).ok()
+}
+
+fn parse_minecraft_atlas_meta(meta_raw: Option<&[u8]>) -> Option<atlas::MinecraftAtlasMeta> {
+    let bytes = meta_raw?;
+    atlas::decode_minecraft_meta(bytes).ok()
+}
+
+fn parse_mipchain_meta(meta_raw: Option<&[u8]>) -> Option<mipchain::MipChainMeta> {
+    let bytes = meta_raw?;
+    mipchain::decode_meta(bytes).ok()
 }
 
 fn dump_atlas_meta(path: &Path, meta: &atlas::AtlasMeta) -> Result<(), Box<dyn Error>> {
@@ -1128,14 +1451,46 @@ fn dump_atlas_meta(path: &Path, meta: &atlas::AtlasMeta) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn predictor_candidates() -> [Predictor; 3] {
-    // Auto-select stays limited to the cheap predictors to avoid slowing down
-    // the full encode path on large atlases.
-    [Predictor::Delta, Predictor::Up, Predictor::None]
+fn dump_mipchain_meta(path: &Path, meta: &mipchain::MipChainMeta) -> Result<(), Box<dyn Error>> {
+    let json = serde_json::to_vec_pretty(meta)?;
+    fs::write(path, json)?;
+    Ok(())
 }
 
-fn color_transform_candidates() -> [ColorTransform; 2] {
-    [ColorTransform::None, ColorTransform::SubGreen]
+fn dump_minecraft_atlas_meta(
+    path: &Path,
+    meta: &atlas::MinecraftAtlasMeta,
+) -> Result<(), Box<dyn Error>> {
+    let json = serde_json::to_vec_pretty(meta)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn predictor_candidates() -> [Predictor; 4] {
+    [
+        Predictor::Delta,
+        Predictor::Up,
+        Predictor::Paeth,
+        Predictor::None,
+    ]
+}
+
+fn color_transform_candidates() -> [ColorTransform; 4] {
+    [
+        ColorTransform::None,
+        ColorTransform::SubGreen,
+        ColorTransform::SubRed,
+        ColorTransform::SubBlue,
+    ]
+}
+
+fn color_transform_auto_rank(transform: ColorTransform) -> u8 {
+    match transform {
+        ColorTransform::None => 0,
+        ColorTransform::SubGreen => 1,
+        ColorTransform::SubRed => 2,
+        ColorTransform::SubBlue => 3,
+    }
 }
 
 fn format_predictor_evals(evals: &[PredictorEval]) -> String {
@@ -1156,7 +1511,23 @@ fn best_predictive_eval(evals: &[PredictorEval]) -> Option<&PredictorEval> {
 fn choose_channel_predictor_from_evals(
     evals: &[PredictorEval],
 ) -> Result<(Predictor, usize), Box<dyn Error>> {
-    let best_predictive = best_predictive_eval(evals);
+    let mut best_predictive = best_predictive_eval(evals);
+    let best_cheap_predictive = evals
+        .iter()
+        .filter(|eval| matches!(eval.predictor, Predictor::Delta | Predictor::Up))
+        .min_by_key(|eval| (eval.size, eval.predictor.auto_rank()));
+
+    if let (Some(best), Some(cheap)) = (best_predictive, best_cheap_predictive) {
+        if best.predictor.is_expensive() {
+            let lhs = (best.size as u64).saturating_mul(10_000);
+            let rhs = (cheap.size as u64)
+                .saturating_mul(10_000u64.saturating_sub(PREDICTOR_EXPENSIVE_MIN_GAIN_BPS));
+            if lhs > rhs {
+                best_predictive = Some(cheap);
+            }
+        }
+    }
+
     let none_eval = evals.iter().find(|eval| eval.predictor == Predictor::None);
 
     match (best_predictive, none_eval) {
@@ -1198,6 +1569,7 @@ fn collect_channel_sample(
     let mut transformed = vec![0u8; width];
     let stride = width * 4;
     let mut sampled_prev_y: Option<usize> = None;
+    let needs_prev = predictor.uses_prev_row();
 
     for i in 0..rows_to_take {
         let y = if rows_to_take == height {
@@ -1212,6 +1584,21 @@ fn collect_channel_sample(
         let row_rgba = &rgba_bytes[y * stride..(y + 1) * stride];
         extract_transformed_channel_row(row_rgba, width, channel, color_transform, &mut row);
 
+        if needs_prev {
+            if y == 0 {
+                prev.fill(0);
+            } else {
+                let prev_rgba = &rgba_bytes[(y - 1) * stride..y * stride];
+                extract_transformed_channel_row(
+                    prev_rgba,
+                    width,
+                    channel,
+                    color_transform,
+                    &mut prev,
+                );
+            }
+        }
+
         encode_row_with_predictor(&row, &prev, predictor, &mut transformed);
         let remain = sample_limit_bytes - sample.len();
         if remain == 0 {
@@ -1224,7 +1611,6 @@ fn collect_channel_sample(
             break;
         }
 
-        prev.copy_from_slice(&row);
         if sample.len() >= sample_limit_bytes {
             break;
         }
@@ -1319,10 +1705,7 @@ fn choose_color_transform_and_predictors(
         .min_by_key(|(_, decision)| {
             (
                 decision.total_size,
-                match decision.transform {
-                    ColorTransform::None => 0u8,
-                    ColorTransform::SubGreen => 1u8,
-                },
+                color_transform_auto_rank(decision.transform),
             )
         })
         .map(|(idx, _)| idx)
@@ -1361,20 +1744,27 @@ fn encode_cmd(
     input: PathBuf,
     output: Option<PathBuf>,
     recursive: bool,
+    mipchain: Option<mipchain::MipChainSpec>,
+    pixel_format: EncodePixelFormat,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     if input.is_dir() {
         if !recursive {
             return Err("input is a directory; use -r/--recursive to process it".into());
         }
-        encode_dir(&input, verbose)
+        encode_dir(&input, mipchain.as_ref(), pixel_format, verbose)
     } else {
         let out_path = output.unwrap_or_else(|| default_encode_output_path(&input));
-        encode_one(&input, &out_path, verbose)
+        encode_one(&input, &out_path, mipchain.as_ref(), pixel_format, verbose)
     }
 }
 
-fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
+fn encode_dir(
+    root: &Path,
+    mipchain: Option<&mipchain::MipChainSpec>,
+    pixel_format: EncodePixelFormat,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
     if verbose {
         println!(
             "[vrawtex] Recursive encode of directory: {}",
@@ -1407,17 +1797,7 @@ fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
         }
 
         let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        let is_image = matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "bmp" | "tga" | "tif" | "tiff" | "gif"
-        );
-
-        if !is_image {
+        if !image_input::is_supported_input_ext(path) {
             skipped += 1;
             continue;
         }
@@ -1436,7 +1816,7 @@ fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
             fs::create_dir_all(parent_dir)?;
         }
 
-        match encode_one(path, &out_path, verbose) {
+        match encode_one(path, &out_path, mipchain, pixel_format, verbose) {
             Ok(_) => processed += 1,
             Err(e) => {
                 failed += 1;
@@ -1457,33 +1837,81 @@ fn encode_dir(root: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn encode_one(input: &Path, out_path: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
+fn encode_one(
+    input: &Path,
+    out_path: &Path,
+    mipchain: Option<&mipchain::MipChainSpec>,
+    pixel_format: EncodePixelFormat,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
     let original_size = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
 
-    let img = image::open(input)?;
-    let (width, height) = img.dimensions();
+    let rgba = image_input::load_rgba8(input)?;
+    let (width, height) = rgba.dimensions();
 
     if verbose {
         println!(
-            "[vrawtex] Encoding {} ({}x{}, RGBA8)",
+            "[vrawtex] Encoding {} ({}x{}, {}, mipchain={})",
             input.display(),
             width,
-            height
+            height,
+            pixel_format.as_str(),
+            mipchain.is_some()
         );
     }
 
-    let rgba = img.to_rgba8();
-    let bytes =
-        encode_rgba8_with_meta_to_vec(&rgba, None, verbose, Some(original_size), start_total)?;
+    let bytes = if let Some(spec) = mipchain {
+        let start_mips = Instant::now();
+        let built = mipchain::build_single_atlas(&rgba, MAX_STRICT_SIDE, spec)?;
+        if verbose {
+            println!(
+                "[vrawtex] Mipchain: levels={}, atlas={}x{}, lanczos_radius=100%, taps={}, ops={}, build={}",
+                built.meta.levels.len(),
+                built.image.width(),
+                built.image.height(),
+                built.resize_stats.taps_total,
+                built.resize_stats.ops_total,
+                format_duration_ns(start_mips.elapsed())
+            );
+        }
+        encode_rgba8_with_meta_to_vec(
+            &built.image,
+            Some(&built.meta_bytes),
+            pixel_format,
+            verbose,
+            Some(original_size),
+            start_total,
+        )?
+    } else {
+        encode_rgba8_with_meta_to_vec(
+            &rgba,
+            None,
+            pixel_format,
+            verbose,
+            Some(original_size),
+            start_total,
+        )?
+    };
     fs::write(out_path, &bytes)?;
 
-    println!(
-        "Encoded {}x{} RGBA8 -> {}",
-        width,
-        height,
-        out_path.display()
-    );
+    if mipchain.is_some() {
+        println!(
+            "Encoded {}x{} {} mipchain -> {}",
+            width,
+            height,
+            pixel_format.as_str(),
+            out_path.display()
+        );
+    } else {
+        println!(
+            "Encoded {}x{} {} -> {}",
+            width,
+            height,
+            pixel_format.as_str(),
+            out_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1528,6 +1956,7 @@ fn worker_for_stream(workers_split: &[u32], stream_idx: usize) -> u32 {
 pub(crate) fn encode_rgba8_with_meta_to_vec(
     rgba: &RgbaImage,
     meta: Option<&[u8]>,
+    pixel_format: EncodePixelFormat,
     verbose: bool,
     original_size_opt: Option<u64>,
     start_total: Instant,
@@ -1542,16 +1971,22 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
         .checked_mul(height as u64)
         .ok_or("width*height overflow")?;
     let plane_size_u64 = pixels_u64; // u8 per channel
-    let raw_planar_size_u64 = plane_size_u64.checked_mul(4).ok_or("raw size overflow")?;
+    let chans = pixel_format.channels();
+    let raw_planar_size_u64 = plane_size_u64
+        .checked_mul(chans as u64)
+        .ok_or("raw size overflow")?;
 
     if plane_size_u64 > usize::MAX as u64 {
         return Err("plane too large for this build (usize overflow)".into());
     }
 
-    let alpha_mode = detect_alpha_mode(rgba_bytes);
+    let alpha_mode = if pixel_format == EncodePixelFormat::Rgba8 {
+        detect_alpha_mode(rgba_bytes)
+    } else {
+        AlphaMode::Opaque255
+    };
     let has_meta = meta.is_some();
     let pixfmt_bits: u16 = 0x0001; // U8
-    let chans: u8 = 4;
 
     // packed alpha bytes if mask:
     let packed_alpha_size_u64 = if alpha_mode == AlphaMode::Mask1Bit {
@@ -1565,9 +2000,9 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     let packed_alpha_size_usize = packed_alpha_size_u64 as usize;
 
     // streams actually stored:
-    let store_alpha_stream =
-        !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
-    let stored_streams = if store_alpha_stream { 4usize } else { 3usize };
+    let store_alpha_stream = chans == 4
+        && !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
+    let stored_streams = 3usize + usize::from(store_alpha_stream);
     let ws = split_workers(ZSTD_WORKERS_TOTAL, stored_streams);
 
     let (color_transform, rgb_predictors, transform_choices) =
@@ -1665,13 +2100,26 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     let mut buf_b = Vec::with_capacity(CHUNK_TARGET);
 
     // alpha buffers:
-    let mut buf_a = Vec::with_capacity(CHUNK_TARGET);
-    let mut buf_amask = Vec::with_capacity(CHUNK_TARGET);
+    let mut buf_a = Vec::with_capacity(if store_alpha_stream && alpha_mode == AlphaMode::Normal {
+        CHUNK_TARGET
+    } else {
+        0
+    });
+    let mut buf_amask =
+        Vec::with_capacity(if store_alpha_stream && alpha_mode == AlphaMode::Mask1Bit {
+            CHUNK_TARGET
+        } else {
+            0
+        });
 
     let mut row_r = vec![0u8; width_usize];
     let mut row_g = vec![0u8; width_usize];
     let mut row_b = vec![0u8; width_usize];
-    let mut row_a = vec![0u8; width_usize];
+    let mut row_a = if chans == 4 {
+        vec![0u8; width_usize]
+    } else {
+        Vec::new()
+    };
 
     let use_prev_r = stream_predictors[0].uses_prev_row();
     let use_prev_g = stream_predictors[1].uses_prev_row();
@@ -1736,7 +2184,13 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     for y in 0..height_usize {
         let row_rgba = &rgba_bytes[y * stride..(y + 1) * stride];
 
-        deinterleave_rgba_row_to_planar(row_rgba, &mut row_r, &mut row_g, &mut row_b, &mut row_a);
+        if chans == 4 {
+            deinterleave_rgba_row_to_planar(
+                row_rgba, &mut row_r, &mut row_g, &mut row_b, &mut row_a,
+            );
+        } else {
+            deinterleave_rgba_row_to_rgb_planar(row_rgba, &mut row_r, &mut row_g, &mut row_b);
+        }
         apply_color_transform_inplace(&mut row_r, &mut row_g, &mut row_b, color_transform);
 
         append_predicted_row(
@@ -1980,7 +2434,8 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
 
     if verbose {
         println!(
-            "[vrawtex] Features: predictor={}, alpha_mode={:?}, has_meta={}, color_transform={}, chunk={} bytes, zstd_level={}, auto_select_zstd_level={}, workers_total={} (split={:?})",
+            "[vrawtex] Features: pixel_format={}, predictor={}, alpha_mode={:?}, has_meta={}, color_transform={}, chunk={} bytes, zstd_level={}, auto_select_zstd_level={}, workers_total={} (split={:?})",
+            pixel_format.as_str(),
             has_predictor,
             alpha_mode,
             has_meta,
@@ -2010,7 +2465,7 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
                 ch.predictor.as_str()
             );
 
-            if i == 2 && !store_alpha_stream {
+            if i == 2 && chans == 4 && !store_alpha_stream {
                 let msg = match alpha_mode {
                     AlphaMode::Opaque255 => "A: ALL 255 (not stored)",
                     AlphaMode::Transparent0 => "A: ALL 0 (not stored)",
@@ -2060,10 +2515,12 @@ pub(crate) fn encode_rgba8_with_meta_to_file(
     rgba: &RgbaImage,
     meta: Option<&[u8]>,
     out_path: &Path,
+    pixel_format: EncodePixelFormat,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
-    let bytes = encode_rgba8_with_meta_to_vec(rgba, meta, verbose, None, start_total)?;
+    let bytes =
+        encode_rgba8_with_meta_to_vec(rgba, meta, pixel_format, verbose, None, start_total)?;
     fs::write(out_path, &bytes)?;
     Ok(())
 }
@@ -2072,6 +2529,7 @@ fn decode_container_to_planes(
     parsed: &ParsedContainer,
     data: &[u8],
     safety: DecodeSafety,
+    materialize_constant_alpha: bool,
 ) -> Result<(Vec<Vec<u8>>, Vec<Predictor>, Vec<u64>, usize), Box<dyn Error>> {
     let legacy_predictors = if parsed.format == ContainerFormat::Legacy {
         legacy_stream_predictors(parsed)
@@ -2114,7 +2572,12 @@ fn decode_container_to_planes(
                 AlphaMode::Transparent0 => 0u8,
                 _ => 255u8,
             };
-            (vec![v; plane_size_usize], Predictor::None)
+            let plane = if materialize_constant_alpha {
+                Some(vec![v; plane_size_usize])
+            } else {
+                None
+            };
+            (plane, Predictor::None)
         } else if parsed.alpha_mode == AlphaMode::Mask1Bit {
             if streams.is_empty() {
                 return Err("missing alpha mask stream".into());
@@ -2139,46 +2602,36 @@ fn decode_container_to_planes(
                 let bit = (byte >> (i & 7)) & 1;
                 *out = if bit != 0 { 255 } else { 0 };
             }
-            (a, Predictor::None)
+            (Some(a), Predictor::None)
         } else {
             if streams.is_empty() {
                 return Err("missing alpha stream".into());
             }
-            (streams.remove(0), stream_predictors.remove(0))
+            (Some(streams.remove(0)), stream_predictors.remove(0))
         };
-        planes.push(a_plane);
+        if let Some(a_plane) = a_plane {
+            planes.push(a_plane);
+        }
         logical_predictors.push(a_predictor);
     }
 
     let width_usize = parsed.width as usize;
     let height_usize = parsed.height as usize;
 
-    decode_plane_with_predictor_inplace(
-        &mut planes[0],
-        width_usize,
-        height_usize,
-        logical_predictors[0],
-    )?;
-    decode_plane_with_predictor_inplace(
-        &mut planes[1],
-        width_usize,
-        height_usize,
-        logical_predictors[1],
-    )?;
-    decode_plane_with_predictor_inplace(
-        &mut planes[2],
-        width_usize,
-        height_usize,
-        logical_predictors[2],
-    )?;
-    if parsed.chans == 4 && parsed.alpha_mode == AlphaMode::Normal {
-        decode_plane_with_predictor_inplace(
-            &mut planes[3],
-            width_usize,
-            height_usize,
-            logical_predictors[3],
-        )?;
+    let predictor_decode_count = if parsed.chans == 4 && parsed.alpha_mode == AlphaMode::Normal {
+        4
+    } else {
+        3
     }
+    .min(planes.len());
+    planes[..predictor_decode_count]
+        .par_iter_mut()
+        .zip(logical_predictors[..predictor_decode_count].par_iter())
+        .try_for_each(|(plane, &predictor)| {
+            decode_plane_with_predictor_inplace(plane, width_usize, height_usize, predictor)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
     inverse_color_transform_rgb_planes_inplace(&mut planes, parsed.color_transform)?;
 
@@ -2199,6 +2652,8 @@ fn decode_cmd(
 
     let parsed = parse_container(&data, safety)?;
     let atlas_meta = parse_atlas_meta(parsed.meta_raw.as_deref());
+    let minecraft_atlas_meta = parse_minecraft_atlas_meta(parsed.meta_raw.as_deref());
+    let mipchain_meta = parse_mipchain_meta(parsed.meta_raw.as_deref());
 
     if verbose {
         println!(
@@ -2221,7 +2676,7 @@ fn decode_cmd(
 
     let start_dec = Instant::now();
     let (planes, plane_predictors, comp_sizes, _end_offset) =
-        decode_container_to_planes(&parsed, &data, safety)?;
+        decode_container_to_planes(&parsed, &data, safety, true)?;
     let elapsed_dec = start_dec.elapsed();
     let elapsed_total = start_total.elapsed();
 
@@ -2332,7 +2787,20 @@ fn decode_cmd(
         }
     }
 
-    if let Some(meta) = atlas_meta.as_ref() {
+    if let Some(meta) = minecraft_atlas_meta.as_ref() {
+        println!(
+            "[vrawtex] Minecraft atlas meta: pad={}, entries={}, orphan_sidecars={}",
+            meta.pad,
+            meta.entries.len(),
+            meta.sidecars.len()
+        );
+        let meta_path = dump_meta.unwrap_or_else(|| with_ext(&base, "minecraft-atlas.json"));
+        dump_minecraft_atlas_meta(&meta_path, meta)?;
+        println!(
+            "[vrawtex] Minecraft atlas meta JSON -> {}",
+            meta_path.display()
+        );
+    } else if let Some(meta) = atlas_meta.as_ref() {
         println!(
             "[vrawtex] Atlas meta: pad={}, entries={}",
             meta.0,
@@ -2341,16 +2809,25 @@ fn decode_cmd(
         let meta_path = dump_meta.unwrap_or_else(|| with_ext(&base, "atlas.json"));
         dump_atlas_meta(&meta_path, meta)?;
         println!("[vrawtex] Atlas meta JSON -> {}", meta_path.display());
+    } else if let Some(meta) = mipchain_meta.as_ref() {
+        println!(
+            "[vrawtex] Mipchain meta: pad={}, levels={}",
+            meta.pad,
+            meta.levels.len()
+        );
+        let meta_path = dump_meta.unwrap_or_else(|| with_ext(&base, "mipchain.json"));
+        dump_mipchain_meta(&meta_path, meta)?;
+        println!("[vrawtex] Mipchain meta JSON -> {}", meta_path.display());
     } else if let Some(path) = dump_meta {
         return Err(format!(
-            "requested --dump-meta {}, but atlas metadata was not found",
+            "requested --dump-meta {}, but recognized metadata was not found",
             path.display()
         )
         .into());
     } else if parsed.has_meta {
         let meta_len = parsed.meta_raw.as_ref().map(|m| m.len()).unwrap_or(0);
         println!(
-            "[vrawtex] Meta block present ({} bytes), atlas schema not recognized",
+            "[vrawtex] Meta block present ({} bytes), schema not recognized",
             meta_len
         );
     }
@@ -2358,13 +2835,163 @@ fn decode_cmd(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct ViewerViewport {
+    scale: f64,
+    center_x: f64,
+    center_y: f64,
+}
+
+impl ViewerViewport {
+    fn new(img_w: usize, img_h: usize, win_w: usize, win_h: usize) -> Self {
+        let mut viewport = Self {
+            scale: fit_view_scale(img_w, img_h, win_w, win_h),
+            center_x: img_w as f64 * 0.5,
+            center_y: img_h as f64 * 0.5,
+        };
+        viewport.clamp_to_image(img_w, img_h, win_w, win_h);
+        viewport
+    }
+
+    fn reset_fit(&mut self, img_w: usize, img_h: usize, win_w: usize, win_h: usize) {
+        self.scale = fit_view_scale(img_w, img_h, win_w, win_h);
+        self.center_x = img_w as f64 * 0.5;
+        self.center_y = img_h as f64 * 0.5;
+        self.clamp_to_image(img_w, img_h, win_w, win_h);
+    }
+
+    fn set_one_to_one(&mut self, img_w: usize, img_h: usize, win_w: usize, win_h: usize) {
+        let scale = 1.0f64.clamp(min_view_scale(img_w, img_h, win_w, win_h), VIEWER_MAX_SCALE);
+        self.set_scale_at_window_point(
+            scale,
+            win_w as f64 * 0.5,
+            win_h as f64 * 0.5,
+            img_w,
+            img_h,
+            win_w,
+            win_h,
+        );
+    }
+
+    fn zoom_by(
+        &mut self,
+        factor: f64,
+        anchor_x: f64,
+        anchor_y: f64,
+        img_w: usize,
+        img_h: usize,
+        win_w: usize,
+        win_h: usize,
+    ) {
+        let scale = (self.scale * factor)
+            .clamp(min_view_scale(img_w, img_h, win_w, win_h), VIEWER_MAX_SCALE);
+        self.set_scale_at_window_point(scale, anchor_x, anchor_y, img_w, img_h, win_w, win_h);
+    }
+
+    fn set_scale_at_window_point(
+        &mut self,
+        scale: f64,
+        anchor_x: f64,
+        anchor_y: f64,
+        img_w: usize,
+        img_h: usize,
+        win_w: usize,
+        win_h: usize,
+    ) {
+        let (image_x, image_y) = self.window_to_image(anchor_x, anchor_y, win_w, win_h);
+        self.scale = scale;
+        self.center_x = image_x - (anchor_x - win_w as f64 * 0.5) / self.scale;
+        self.center_y = image_y - (anchor_y - win_h as f64 * 0.5) / self.scale;
+        self.clamp_to_image(img_w, img_h, win_w, win_h);
+    }
+
+    fn pan_by_window_delta(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        img_w: usize,
+        img_h: usize,
+        win_w: usize,
+        win_h: usize,
+    ) {
+        self.center_x -= dx / self.scale;
+        self.center_y -= dy / self.scale;
+        self.clamp_to_image(img_w, img_h, win_w, win_h);
+    }
+
+    fn pan_by_image_delta(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        img_w: usize,
+        img_h: usize,
+        win_w: usize,
+        win_h: usize,
+    ) {
+        self.center_x += dx;
+        self.center_y += dy;
+        self.clamp_to_image(img_w, img_h, win_w, win_h);
+    }
+
+    fn clamp_to_image(&mut self, img_w: usize, img_h: usize, win_w: usize, win_h: usize) {
+        if img_w == 0 || img_h == 0 || win_w == 0 || win_h == 0 {
+            return;
+        }
+
+        let half_view_w = win_w as f64 / self.scale * 0.5;
+        let half_view_h = win_h as f64 / self.scale * 0.5;
+        let img_w = img_w as f64;
+        let img_h = img_h as f64;
+
+        if half_view_w * 2.0 >= img_w {
+            self.center_x = img_w * 0.5;
+        } else {
+            self.center_x = self.center_x.clamp(half_view_w, img_w - half_view_w);
+        }
+
+        if half_view_h * 2.0 >= img_h {
+            self.center_y = img_h * 0.5;
+        } else {
+            self.center_y = self.center_y.clamp(half_view_h, img_h - half_view_h);
+        }
+    }
+
+    fn window_to_image(&self, x: f64, y: f64, win_w: usize, win_h: usize) -> (f64, f64) {
+        (
+            (x - win_w as f64 * 0.5) / self.scale + self.center_x,
+            (y - win_h as f64 * 0.5) / self.scale + self.center_y,
+        )
+    }
+}
+
+fn fit_view_scale(img_w: usize, img_h: usize, win_w: usize, win_h: usize) -> f64 {
+    if img_w == 0 || img_h == 0 || win_w == 0 || win_h == 0 {
+        return 1.0;
+    }
+
+    (win_w as f64 / img_w as f64)
+        .min(win_h as f64 / img_h as f64)
+        .min(1.0)
+        .clamp(VIEWER_MIN_SCALE, VIEWER_MAX_SCALE)
+}
+
+fn min_view_scale(img_w: usize, img_h: usize, win_w: usize, win_h: usize) -> f64 {
+    fit_view_scale(img_w, img_h, win_w, win_h)
+}
+
+fn viewer_title(input: &Path, scale: f64) -> String {
+    format!("vrawtex: {} ({:.0}%)", input.display(), scale * 100.0)
+}
+
 fn render_viewport(
     planes: &[Vec<u8>],
     chans: u8,
+    alpha_mode: AlphaMode,
     img_w: usize,
     img_h: usize,
     win_w: usize,
     win_h: usize,
+    viewport: &ViewerViewport,
     fb: &mut [u32],
 ) {
     fb.fill(0);
@@ -2372,43 +2999,46 @@ fn render_viewport(
         return;
     }
 
-    let sx = win_w as f64 / img_w as f64;
-    let sy = win_h as f64 / img_h as f64;
-    let scale = sx.min(sy);
-
-    let draw_w = ((img_w as f64 * scale).max(1.0).round() as usize).min(win_w);
-    let draw_h = ((img_h as f64 * scale).max(1.0).round() as usize).min(win_h);
-    let off_x = (win_w - draw_w) / 2;
-    let off_y = (win_h - draw_h) / 2;
-
-    let mut src_x_map = vec![0usize; draw_w];
-    let mut src_y_map = vec![0usize; draw_h];
-
-    for (dx, sx_out) in src_x_map.iter_mut().enumerate() {
-        let src = ((dx as f64 + 0.5) / draw_w as f64 * img_w as f64).floor() as isize;
-        *sx_out = src.clamp(0, img_w as isize - 1) as usize;
-    }
-    for (dy, sy_out) in src_y_map.iter_mut().enumerate() {
-        let src = ((dy as f64 + 0.5) / draw_h as f64 * img_h as f64).floor() as isize;
-        *sy_out = src.clamp(0, img_h as isize - 1) as usize;
+    let mut src_x_map = vec![usize::MAX; win_w];
+    for (x, src_x_out) in src_x_map.iter_mut().enumerate() {
+        let src_x = ((x as f64 + 0.5 - win_w as f64 * 0.5) / viewport.scale + viewport.center_x)
+            .floor() as isize;
+        if src_x >= 0 && src_x < img_w as isize {
+            *src_x_out = src_x as usize;
+        }
     }
 
-    for (dy, &src_y) in src_y_map.iter().enumerate() {
-        let dst_row = (off_y + dy) * win_w + off_x;
-        for (dx, &src_x) in src_x_map.iter().enumerate() {
-            let src_idx = src_y * img_w + src_x;
+    for y in 0..win_h {
+        let src_y = ((y as f64 + 0.5 - win_h as f64 * 0.5) / viewport.scale + viewport.center_y)
+            .floor() as isize;
+        if src_y < 0 || src_y >= img_h as isize {
+            continue;
+        }
+
+        let src_row = src_y as usize * img_w;
+        let dst_row = y * win_w;
+        for (x, &src_x) in src_x_map.iter().enumerate() {
+            if src_x == usize::MAX {
+                continue;
+            }
+
+            let src_idx = src_row + src_x;
             let sr = planes[0][src_idx] as u32;
             let sg = planes[1][src_idx] as u32;
             let sb = planes[2][src_idx] as u32;
             let sa = if chans == 4 {
-                planes[3][src_idx] as u32
+                match alpha_mode {
+                    AlphaMode::Opaque255 => 255,
+                    AlphaMode::Transparent0 => 0,
+                    _ => planes.get(3).map(|a| a[src_idx] as u32).unwrap_or(255),
+                }
             } else {
                 255
             };
             let out_r = (sr * sa + 127) / 255;
             let out_g = (sg * sa + 127) / 255;
             let out_b = (sb * sa + 127) / 255;
-            fb[dst_row + dx] = (out_r << 16) | (out_g << 8) | out_b;
+            fb[dst_row + x] = (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 }
@@ -2420,6 +3050,8 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
 
     let parsed = parse_container(&data, safety)?;
     let atlas_meta = parse_atlas_meta(parsed.meta_raw.as_deref());
+    let minecraft_atlas_meta = parse_minecraft_atlas_meta(parsed.meta_raw.as_deref());
+    let mipchain_meta = parse_mipchain_meta(parsed.meta_raw.as_deref());
 
     if verbose {
         println!(
@@ -2435,20 +3067,33 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
 
     let start_dec = Instant::now();
     let (planes, plane_predictors, comp_sizes, _end_offset) =
-        decode_container_to_planes(&parsed, &data, safety)?;
+        decode_container_to_planes(&parsed, &data, safety, false)?;
     let elapsed_dec = start_dec.elapsed();
     let elapsed_total = start_total.elapsed();
 
-    if let Some(meta) = atlas_meta.as_ref() {
+    if let Some(meta) = minecraft_atlas_meta.as_ref() {
+        println!(
+            "[vrawtex] Minecraft atlas meta: pad={}, entries={}, orphan_sidecars={}",
+            meta.pad,
+            meta.entries.len(),
+            meta.sidecars.len()
+        );
+    } else if let Some(meta) = atlas_meta.as_ref() {
         println!(
             "[vrawtex] Atlas meta: pad={}, entries={}",
             meta.0,
             meta.1.len()
         );
+    } else if let Some(meta) = mipchain_meta.as_ref() {
+        println!(
+            "[vrawtex] Mipchain meta: pad={}, levels={}",
+            meta.pad,
+            meta.levels.len()
+        );
     } else if parsed.has_meta {
         let meta_len = parsed.meta_raw.as_ref().map(|m| m.len()).unwrap_or(0);
         println!(
-            "[vrawtex] Meta block present ({} bytes), atlas schema not recognized",
+            "[vrawtex] Meta block present ({} bytes), schema not recognized",
             meta_len
         );
     }
@@ -2476,12 +3121,17 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
         },
     )?;
 
+    let mut viewport = ViewerViewport::new(img_w, img_h, init_w, init_h);
+    let mut title_scale = viewport.scale;
+    window.set_title(&viewer_title(&input, viewport.scale));
+
     let mut fb: Vec<u32> = Vec::new();
     let mut cached_size: (usize, usize) = (0, 0);
+    let mut last_mouse_pos: Option<(f32, f32)> = None;
     let mut dirty = true;
 
     println!(
-        "Opened {}x{} ({} channels) from {} (ESC to close)",
+        "Opened {}x{} ({} channels) from {} (ESC to close, mouse wheel/+/- zoom, 0 fit, 1 100%, LMB drag pan)",
         parsed.width,
         parsed.height,
         parsed.chans,
@@ -2528,11 +3178,116 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
 
         if cached_size != (win_w, win_h) {
             cached_size = (win_w, win_h);
+            viewport.clamp_to_image(img_w, img_h, win_w, win_h);
             dirty = true;
         }
 
+        if let Some((_, scroll_y)) = window.get_scroll_wheel() {
+            if scroll_y.abs() > f32::EPSILON {
+                let (mouse_x, mouse_y) = window
+                    .get_mouse_pos(MouseMode::Clamp)
+                    .unwrap_or((win_w as f32 * 0.5, win_h as f32 * 0.5));
+                viewport.zoom_by(
+                    VIEWER_ZOOM_STEP.powf(scroll_y as f64),
+                    mouse_x as f64,
+                    mouse_y as f64,
+                    img_w,
+                    img_h,
+                    win_w,
+                    win_h,
+                );
+                dirty = true;
+            }
+        }
+
+        if window.is_key_pressed(Key::Equal, KeyRepeat::Yes) {
+            viewport.zoom_by(
+                VIEWER_ZOOM_STEP,
+                win_w as f64 * 0.5,
+                win_h as f64 * 0.5,
+                img_w,
+                img_h,
+                win_w,
+                win_h,
+            );
+            dirty = true;
+        }
+
+        if window.is_key_pressed(Key::Minus, KeyRepeat::Yes) {
+            viewport.zoom_by(
+                1.0 / VIEWER_ZOOM_STEP,
+                win_w as f64 * 0.5,
+                win_h as f64 * 0.5,
+                img_w,
+                img_h,
+                win_w,
+                win_h,
+            );
+            dirty = true;
+        }
+
+        if window.is_key_pressed(Key::Key0, KeyRepeat::No) {
+            viewport.reset_fit(img_w, img_h, win_w, win_h);
+            dirty = true;
+        }
+
+        if window.is_key_pressed(Key::Key1, KeyRepeat::No) {
+            viewport.set_one_to_one(img_w, img_h, win_w, win_h);
+            dirty = true;
+        }
+
+        let key_pan = VIEWER_KEY_PAN_PIXELS / viewport.scale;
+        let mut key_dx = 0.0;
+        let mut key_dy = 0.0;
+        if window.is_key_down(Key::Left) {
+            key_dx -= key_pan;
+        }
+        if window.is_key_down(Key::Right) {
+            key_dx += key_pan;
+        }
+        if window.is_key_down(Key::Up) {
+            key_dy -= key_pan;
+        }
+        if window.is_key_down(Key::Down) {
+            key_dy += key_pan;
+        }
+        if key_dx != 0.0 || key_dy != 0.0 {
+            viewport.pan_by_image_delta(key_dx, key_dy, img_w, img_h, win_w, win_h);
+            dirty = true;
+        }
+
+        let mouse_pos = window.get_mouse_pos(MouseMode::Clamp);
+        if window.get_mouse_down(MouseButton::Left) {
+            if let (Some(prev), Some(current)) = (last_mouse_pos, mouse_pos) {
+                let dx = current.0 - prev.0;
+                let dy = current.1 - prev.1;
+                if dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON {
+                    viewport.pan_by_window_delta(dx as f64, dy as f64, img_w, img_h, win_w, win_h);
+                    dirty = true;
+                }
+            }
+            last_mouse_pos = mouse_pos;
+        } else {
+            last_mouse_pos = None;
+        }
+
+        if (viewport.scale - title_scale).abs() > 0.0001 {
+            title_scale = viewport.scale;
+            window.set_title(&viewer_title(&input, viewport.scale));
+        }
+
         if dirty {
-            render_viewport(&planes, parsed.chans, img_w, img_h, win_w, win_h, &mut fb);
+            render_viewport(
+                &planes,
+                parsed.chans,
+                parsed.alpha_mode,
+                img_w,
+                img_h,
+                win_w,
+                win_h,
+                &viewport,
+                &mut fb,
+            );
             dirty = false;
         }
 
@@ -2607,7 +3362,35 @@ fn inspect_cmd(
     }
 
     let atlas_meta = parse_atlas_meta(parsed.meta_raw.as_deref());
-    if let Some(meta) = atlas_meta.as_ref() {
+    let minecraft_atlas_meta = parse_minecraft_atlas_meta(parsed.meta_raw.as_deref());
+    let mipchain_meta = parse_mipchain_meta(parsed.meta_raw.as_deref());
+    if let Some(meta) = minecraft_atlas_meta.as_ref() {
+        println!(
+            "[vrawtex] Minecraft atlas meta: pad={} entries={} orphan_sidecars={}",
+            meta.pad,
+            meta.entries.len(),
+            meta.sidecars.len()
+        );
+        if verbose {
+            for entry in meta.entries.iter().take(10) {
+                println!(
+                    "  {} overlay={} x={} y={} w={} h={} source={}x{} mcmeta={}",
+                    entry.resource,
+                    entry.overlay.as_deref().unwrap_or("base"),
+                    entry.x,
+                    entry.y,
+                    entry.w,
+                    entry.h,
+                    entry.source_width,
+                    entry.source_height,
+                    entry.mcmeta.is_some()
+                );
+            }
+            if meta.entries.len() > 10 {
+                println!("  ... and {} more", meta.entries.len() - 10);
+            }
+        }
+    } else if let Some(meta) = atlas_meta.as_ref() {
         println!(
             "[vrawtex] Atlas meta: pad={} entries={}",
             meta.0,
@@ -2624,10 +3407,27 @@ fn inspect_cmd(
                 println!("  ... and {} more", meta.1.len() - 10);
             }
         }
+    } else if let Some(meta) = mipchain_meta.as_ref() {
+        println!(
+            "[vrawtex] Mipchain meta: pad={} levels={}",
+            meta.pad,
+            meta.levels.len()
+        );
+        if verbose {
+            for level in meta.levels.iter().take(16) {
+                println!(
+                    "  mip{} x={} y={} w={} h={}",
+                    level.level, level.x, level.y, level.w, level.h
+                );
+            }
+            if meta.levels.len() > 16 {
+                println!("  ... and {} more", meta.levels.len() - 16);
+            }
+        }
     } else if parsed.has_meta {
         let meta_len = parsed.meta_raw.as_ref().map(|m| m.len()).unwrap_or(0);
         println!(
-            "[vrawtex] Meta block present ({} bytes), atlas schema not recognized",
+            "[vrawtex] Meta block present ({} bytes), schema not recognized",
             meta_len
         );
     } else {
@@ -2635,9 +3435,18 @@ fn inspect_cmd(
     }
 
     if let Some(path) = dump_meta {
-        let meta = atlas_meta.ok_or("cannot dump meta: atlas metadata not found")?;
-        dump_atlas_meta(&path, &meta)?;
-        println!("[vrawtex] Atlas meta JSON -> {}", path.display());
+        if let Some(meta) = minecraft_atlas_meta.as_ref() {
+            dump_minecraft_atlas_meta(&path, meta)?;
+            println!("[vrawtex] Minecraft atlas meta JSON -> {}", path.display());
+        } else if let Some(meta) = atlas_meta.as_ref() {
+            dump_atlas_meta(&path, meta)?;
+            println!("[vrawtex] Atlas meta JSON -> {}", path.display());
+        } else if let Some(meta) = mipchain_meta.as_ref() {
+            dump_mipchain_meta(&path, meta)?;
+            println!("[vrawtex] Mipchain meta JSON -> {}", path.display());
+        } else {
+            return Err("cannot dump meta: recognized metadata not found".into());
+        }
     }
 
     Ok(())
@@ -2704,4 +3513,221 @@ fn with_ext(base: &Path, ext: &str) -> PathBuf {
     let mut p = base.to_path_buf();
     p.set_extension(ext);
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_mipchain_flag_does_not_consume_input_path() {
+        let args = normalize_mipchain_args(
+            ["vrawtex", "encode", "--mipchain", "input.png"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert_eq!(args[2], "--mipchain=0");
+        assert_eq!(args[3], "input.png");
+    }
+
+    #[test]
+    fn mipchain_level_count_remains_an_option_value() {
+        let args = normalize_mipchain_args(
+            ["vrawtex", "atlas", "--mipchain", "4", "assets"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert_eq!(args[2], "--mipchain");
+        assert_eq!(args[3], "4");
+    }
+
+    #[test]
+    fn color_transforms_roundtrip() {
+        let original_r = vec![0, 17, 128, 255, 42, 201];
+        let original_g = vec![255, 19, 127, 0, 42, 11];
+        let original_b = vec![5, 200, 128, 1, 99, 77];
+
+        for transform in color_transform_candidates() {
+            let mut r = original_r.clone();
+            let mut g = original_g.clone();
+            let mut b = original_b.clone();
+
+            apply_color_transform_inplace(&mut r, &mut g, &mut b, transform);
+
+            let mut planes = vec![r, g, b];
+            inverse_color_transform_rgb_planes_inplace(&mut planes, transform).unwrap();
+
+            assert_eq!(planes[0], original_r, "transform={}", transform.as_str());
+            assert_eq!(planes[1], original_g, "transform={}", transform.as_str());
+            assert_eq!(planes[2], original_b, "transform={}", transform.as_str());
+        }
+    }
+
+    #[test]
+    fn up_predictor_roundtrips_with_original_prev_row() {
+        let width = 4usize;
+        let height = 3usize;
+        let original = vec![10, 20, 30, 40, 12, 22, 28, 41, 14, 19, 32, 43];
+
+        let mut encoded = Vec::new();
+        let mut prev = vec![0u8; width];
+        let mut scratch = vec![0u8; width];
+
+        for y in 0..height {
+            let row_original = original[y * width..(y + 1) * width].to_vec();
+            let mut row = row_original.clone();
+
+            append_predicted_row(&mut row, &prev, Predictor::Up, &mut scratch, &mut encoded);
+
+            assert_eq!(row, row_original);
+            prev.copy_from_slice(&row_original);
+        }
+
+        decode_plane_with_predictor_inplace(&mut encoded, width, height, Predictor::Up).unwrap();
+        assert_eq!(encoded, original);
+    }
+
+    #[test]
+    fn paeth_predictor_roundtrips() {
+        let width = 5usize;
+        let height = 4usize;
+        let original = vec![
+            7, 15, 21, 34, 55, 8, 18, 24, 40, 61, 12, 19, 31, 42, 65, 13, 21, 34, 48, 70,
+        ];
+
+        let mut encoded = Vec::new();
+        let mut prev = vec![0u8; width];
+        let mut scratch = vec![0u8; width];
+
+        for y in 0..height {
+            let row_original = original[y * width..(y + 1) * width].to_vec();
+            let mut row = row_original.clone();
+
+            append_predicted_row(
+                &mut row,
+                &prev,
+                Predictor::Paeth,
+                &mut scratch,
+                &mut encoded,
+            );
+
+            assert_eq!(row, row_original);
+            prev.copy_from_slice(&row_original);
+        }
+
+        decode_plane_with_predictor_inplace(&mut encoded, width, height, Predictor::Paeth).unwrap();
+        assert_eq!(encoded, original);
+    }
+
+    #[test]
+    fn rgb8_container_discards_alpha_and_roundtrips_rgb() {
+        let rgba = RgbaImage::from_raw(
+            3,
+            2,
+            vec![
+                1, 2, 3, 0, 10, 20, 30, 64, 100, 110, 120, 255, 4, 5, 6, 7, 40, 50, 60, 70, 200,
+                210, 220, 230,
+            ],
+        )
+        .unwrap();
+
+        let encoded = encode_rgba8_with_meta_to_vec(
+            &rgba,
+            None,
+            EncodePixelFormat::Rgb8,
+            false,
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        let parsed = parse_container(&encoded, DecodeSafety::Strict).unwrap();
+        let (planes, _, _, _) =
+            decode_container_to_planes(&parsed, &encoded, DecodeSafety::Strict, true).unwrap();
+
+        assert_eq!(parsed.chans, 3);
+        assert!(!parsed.store_alpha_stream);
+        assert_eq!(planes.len(), 3);
+        assert_eq!(planes[0], vec![1, 10, 100, 4, 40, 200]);
+        assert_eq!(planes[1], vec![2, 20, 110, 5, 50, 210]);
+        assert_eq!(planes[2], vec![3, 30, 120, 6, 60, 220]);
+    }
+
+    #[test]
+    fn rgba8_container_still_roundtrips_alpha() {
+        let rgba = RgbaImage::from_raw(
+            3,
+            2,
+            vec![
+                1, 2, 3, 0, 10, 20, 30, 64, 100, 110, 120, 255, 4, 5, 6, 7, 40, 50, 60, 70, 200,
+                210, 220, 230,
+            ],
+        )
+        .unwrap();
+
+        let encoded = encode_rgba8_with_meta_to_vec(
+            &rgba,
+            None,
+            EncodePixelFormat::Rgba8,
+            false,
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        let parsed = parse_container(&encoded, DecodeSafety::Strict).unwrap();
+        let (planes, _, _, _) =
+            decode_container_to_planes(&parsed, &encoded, DecodeSafety::Strict, true).unwrap();
+
+        assert_eq!(parsed.chans, 4);
+        assert!(parsed.store_alpha_stream);
+        assert_eq!(planes[3], vec![0, 64, 255, 7, 70, 230]);
+    }
+
+    #[test]
+    fn single_mipchain_container_exposes_mipchain_meta() {
+        let rgba = RgbaImage::from_fn(8, 4, |x, y| {
+            image::Rgba([(x * 20) as u8, (y * 40) as u8, 90, 255])
+        });
+        let spec = mipchain::MipChainSpec::from_cli(Some(0), Vec::new())
+            .unwrap()
+            .unwrap();
+        let built = mipchain::build_single_atlas(&rgba, MAX_STRICT_SIDE, &spec).unwrap();
+        let encoded = encode_rgba8_with_meta_to_vec(
+            &built.image,
+            Some(&built.meta_bytes),
+            EncodePixelFormat::Rgba8,
+            false,
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        let parsed = parse_container(&encoded, DecodeSafety::Strict).unwrap();
+        let meta = parse_mipchain_meta(parsed.meta_raw.as_deref()).unwrap();
+        let (planes, _, _, _) =
+            decode_container_to_planes(&parsed, &encoded, DecodeSafety::Strict, true).unwrap();
+
+        assert_eq!(parsed.chans, 4);
+        assert_eq!(meta.levels.len(), 4);
+        assert_eq!(planes.len(), 4);
+    }
+
+    #[test]
+    fn viewer_fit_scale_never_upscales_small_images() {
+        assert_eq!(fit_view_scale(320, 240, 1920, 1080), 1.0);
+        assert!((fit_view_scale(4000, 2000, 1000, 1000) - 0.25).abs() < 0.000001);
+    }
+
+    #[test]
+    fn viewer_zoom_keeps_anchor_under_cursor() {
+        let mut viewport = ViewerViewport {
+            scale: 1.0,
+            center_x: 50.0,
+            center_y: 50.0,
+        };
+        let before = viewport.window_to_image(12.0, 8.0, 20, 20);
+        viewport.zoom_by(2.0, 12.0, 8.0, 100, 100, 20, 20);
+        let after = viewport.window_to_image(12.0, 8.0, 20, 20);
+
+        assert!((before.0 - after.0).abs() < 0.000001);
+        assert!((before.1 - after.1).abs() < 0.000001);
+    }
 }
