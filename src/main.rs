@@ -229,6 +229,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             mipchain,
             size,
             minecraft,
+            ico,
+            desc,
+            name,
         } => {
             if inputs.is_empty() {
                 return Err("atlas: need at least one INPUT (file or directory)".into());
@@ -245,7 +248,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .into(),
                 );
             }
+            if !minecraft && (ico.is_some() || desc.is_some() || name.is_some()) {
+                return Err("atlas --ico/--desc/--name require --minecraft".into());
+            }
             let mipchain = mipchain::MipChainSpec::from_cli(mipchain, size)?;
+            let minecraft_options = minecraft.then_some(atlas::MinecraftPackOptions {
+                name,
+                description: desc,
+                icon: ico,
+            });
             atlas::atlas_cmd(
                 inputs,
                 output,
@@ -257,7 +268,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 } else {
                     EncodePixelFormat::Rgba8
                 },
-                minecraft,
+                minecraft_options,
                 cli.verbose,
             )
         }
@@ -368,13 +379,13 @@ enum Command {
         dump_meta: Option<PathBuf>,
     },
 
-    /// Build texture atlas .vrawtex from many images (and/or directories)
+    /// Build texture atlas .vrawtex, or .vtp with --minecraft
     Atlas {
         /// Input images and/or directories (directories scanned recursively for images)
         #[arg(value_name = "INPUTS")]
         inputs: Vec<PathBuf>,
 
-        /// Output file (optional). Default: ./atlas.vrawtex
+        /// Output file (optional). Default: ./atlas.vrawtex, or <pack>.vtp with --minecraft
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
 
@@ -401,6 +412,18 @@ enum Command {
         /// Pack one Minecraft resource-pack root and preserve resource locations/.mcmeta
         #[arg(long = "minecraft")]
         minecraft: bool,
+
+        /// Minecraft texture pack icon blob. Defaults to pack.png when present.
+        #[arg(long = "ico", value_name = "PATH")]
+        ico: Option<PathBuf>,
+
+        /// Minecraft texture pack short description
+        #[arg(long = "desc", value_name = "TEXT")]
+        desc: Option<String>,
+
+        /// Minecraft texture pack display name
+        #[arg(long = "name", value_name = "TEXT")]
+        name: Option<String>,
     },
 }
 
@@ -1462,6 +1485,15 @@ fn dump_minecraft_atlas_meta(
     meta: &atlas::MinecraftAtlasMeta,
 ) -> Result<(), Box<dyn Error>> {
     let json = serde_json::to_vec_pretty(meta)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn dump_texture_pack_header(
+    path: &Path,
+    header: &atlas::TexturePackHeader,
+) -> Result<(), Box<dyn Error>> {
+    let json = serde_json::to_vec_pretty(header)?;
     fs::write(path, json)?;
     Ok(())
 }
@@ -3305,6 +3337,49 @@ fn inspect_cmd(
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let data = fs::read(&input)?;
+    if atlas::is_texture_pack(&data) {
+        let header = atlas::decode_texture_pack_header(&data)?;
+        println!("File: {}", input.display());
+        println!(
+            "Format: VTP (version={}) | name=\"{}\" | atlases={} | icon={}",
+            header.version,
+            header.name,
+            header.atlases.len(),
+            header.icon.is_some()
+        );
+        println!(
+            "Description: {}",
+            if header.description.is_empty() {
+                "(empty)"
+            } else {
+                header.description.as_str()
+            }
+        );
+        println!(
+            "Layout: blob_section_offset={} sidecars={} pack_mcmeta={}",
+            header.blob_section_offset,
+            header.sidecars.len(),
+            header.pack_mcmeta.is_some()
+        );
+        if let Some(icon) = header.icon.as_ref() {
+            println!(
+                "Icon: offset={} len={} format={}",
+                icon.offset, icon.len, icon.format
+            );
+        }
+        for atlas in &header.atlases {
+            println!(
+                "Atlas #{}: offset={} len={} image={}x{} entries={}",
+                atlas.index, atlas.offset, atlas.len, atlas.width, atlas.height, atlas.entries
+            );
+        }
+        if let Some(path) = dump_meta {
+            dump_texture_pack_header(&path, &header)?;
+            println!("[vrawtex] VTP header JSON -> {}", path.display());
+        }
+        return Ok(());
+    }
+
     let parsed = parse_container(&data, safety)?;
     let legacy_predictors = if parsed.format == ContainerFormat::Legacy {
         legacy_stream_predictors(&parsed)

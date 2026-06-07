@@ -20,6 +20,18 @@ const EDGE_THICKNESS: u32 = 2; // average 2px band
 const EDGE_RADIUS_PX: u32 = 5; // small, fast
 const MINECRAFT_META_KIND: &str = "vrawtex.minecraft_atlas";
 const MINECRAFT_META_VERSION: u16 = 2;
+const TEXTURE_PACK_KIND: &str = "vrawtex.texture_pack";
+const TEXTURE_PACK_HEADER_VERSION: u16 = 1;
+const TEXTURE_PACK_CONTAINER_VERSION: u16 = 1;
+const TEXTURE_PACK_MAGIC: &[u8; 8] = b"VRAWVTP\0";
+const TEXTURE_PACK_PREAMBLE_LEN: usize = 8 + 2 + 8;
+
+#[derive(Clone, Debug, Default)]
+pub struct MinecraftPackOptions {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct TexItem {
@@ -42,6 +54,7 @@ struct MinecraftResource {
 }
 
 struct MinecraftPack {
+    root: PathBuf,
     pack_mcmeta: Option<String>,
     layers: Vec<MinecraftLayer>,
     sidecars: Vec<MinecraftAtlasSidecar>,
@@ -50,6 +63,49 @@ struct MinecraftPack {
 struct MinecraftLayer {
     overlay: Option<String>,
     assets: PathBuf,
+}
+
+struct TexturePackBlobData {
+    format: String,
+    bytes: Vec<u8>,
+}
+
+struct TexturePackAtlasData {
+    width: u32,
+    height: u32,
+    entries: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TexturePackHeader {
+    pub kind: String,
+    pub version: u16,
+    pub name: String,
+    pub description: String,
+    pub pack_mcmeta: Option<String>,
+    #[serde(default)]
+    pub sidecars: Vec<MinecraftAtlasSidecar>,
+    pub blob_section_offset: u64,
+    pub icon: Option<TexturePackBlob>,
+    pub atlases: Vec<TexturePackAtlasBlob>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TexturePackBlob {
+    pub offset: u64,
+    pub len: u64,
+    pub format: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TexturePackAtlasBlob {
+    pub index: u32,
+    pub offset: u64,
+    pub len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub entries: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,7 +123,17 @@ fn is_image_ext(p: &Path) -> bool {
 
 fn minecraft_pack(inputs: &[PathBuf]) -> Result<MinecraftPack, Box<dyn Error>> {
     if inputs.len() != 1 || !inputs[0].is_dir() {
-        return Err("atlas --minecraft requires exactly one resource-pack root directory".into());
+        let got = inputs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "atlas --minecraft requires exactly one resource-pack root directory (got {}: [{}])",
+            inputs.len(),
+            got
+        )
+        .into());
     }
 
     let root = inputs[0].clone();
@@ -154,10 +220,78 @@ fn minecraft_pack(inputs: &[PathBuf]) -> Result<MinecraftPack, Box<dyn Error>> {
     sidecars.sort_by(|a, b| (&a.overlay, &a.resource).cmp(&(&b.overlay, &b.resource)));
 
     Ok(MinecraftPack {
+        root,
         pack_mcmeta,
         layers,
         sidecars,
     })
+}
+
+fn pack_description(pack_mcmeta: Option<&str>) -> Option<String> {
+    let raw = pack_mcmeta?;
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let description = json.get("pack")?.get("description")?;
+    if let Some(text) = description.as_str() {
+        Some(text.to_owned())
+    } else {
+        Some(description.to_string())
+    }
+}
+
+fn default_pack_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Minecraft Texture Pack")
+        .to_owned()
+}
+
+fn texture_pack_output_path(output: Option<PathBuf>, pack: &MinecraftPack) -> PathBuf {
+    output.unwrap_or_else(|| {
+        let stem = pack
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("pack");
+        PathBuf::from(format!("{stem}.vtp"))
+    })
+}
+
+fn blob_format(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| matches!(ext.as_str(), "png" | "raw" | "vrawtex"))
+        .unwrap_or_else(|| "raw".to_owned())
+}
+
+fn load_icon_blob(
+    pack: &MinecraftPack,
+    options: &MinecraftPackOptions,
+) -> Result<Option<TexturePackBlobData>, Box<dyn Error>> {
+    let path = if let Some(path) = options.icon.as_ref() {
+        Some(path.clone())
+    } else {
+        let pack_icon = pack.root.join("pack.png");
+        pack_icon.is_file().then_some(pack_icon)
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Err(format!("atlas --minecraft --ico: {} is not a file", path.display()).into());
+    }
+    let bytes = fs::read(&path).map_err(|e| {
+        format!(
+            "atlas --minecraft --ico: cannot read {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(Some(TexturePackBlobData {
+        format: blob_format(&path),
+        bytes,
+    }))
 }
 
 fn collect_inputs(
@@ -728,6 +862,74 @@ pub fn decode_minecraft_meta(bytes: &[u8]) -> Result<MinecraftAtlasMeta, Box<dyn
     Ok(meta)
 }
 
+pub fn is_texture_pack(data: &[u8]) -> bool {
+    data.starts_with(TEXTURE_PACK_MAGIC)
+}
+
+pub fn decode_texture_pack_header(data: &[u8]) -> Result<TexturePackHeader, Box<dyn Error>> {
+    if data.len() < TEXTURE_PACK_PREAMBLE_LEN {
+        return Err("truncated vtp: header preamble missing".into());
+    }
+    if !is_texture_pack(data) {
+        return Err("not a vrawtex texture pack".into());
+    }
+
+    let version = u16::from_le_bytes([data[8], data[9]]);
+    if version != TEXTURE_PACK_CONTAINER_VERSION {
+        return Err(format!("unsupported vtp container version: {version}").into());
+    }
+
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&data[10..18]);
+    let header_len = u64::from_le_bytes(len_bytes) as usize;
+    let header_start = TEXTURE_PACK_PREAMBLE_LEN;
+    let header_end = header_start
+        .checked_add(header_len)
+        .ok_or("vtp header length overflow")?;
+    if header_end > data.len() {
+        return Err("truncated vtp: header bytes missing".into());
+    }
+
+    let header: TexturePackHeader = rmp_serde::from_slice(&data[header_start..header_end])?;
+    if header.kind != TEXTURE_PACK_KIND {
+        return Err("not vrawtex texture pack metadata".into());
+    }
+    if header.version != TEXTURE_PACK_HEADER_VERSION {
+        return Err(format!(
+            "unsupported texture pack header version: {}",
+            header.version
+        )
+        .into());
+    }
+    if header.blob_section_offset != header_end as u64 {
+        return Err("invalid vtp: blob_section_offset does not match header size".into());
+    }
+
+    if let Some(icon) = header.icon.as_ref() {
+        validate_blob_range(data.len(), icon.offset, icon.len, "icon")?;
+    }
+    for atlas in &header.atlases {
+        validate_blob_range(data.len(), atlas.offset, atlas.len, "atlas")?;
+    }
+
+    Ok(header)
+}
+
+fn validate_blob_range(
+    file_len: usize,
+    offset: u64,
+    len: u64,
+    kind: &str,
+) -> Result<(), Box<dyn Error>> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| format!("invalid vtp: {kind} blob range overflow"))?;
+    if end > file_len as u64 {
+        return Err(format!("invalid vtp: {kind} blob range exceeds file size").into());
+    }
+    Ok(())
+}
+
 pub fn meta_rects(meta: &AtlasMeta) -> Vec<AtlasRect> {
     meta.1
         .iter()
@@ -830,6 +1032,124 @@ fn output_path_for_mip(base: &Path, level: usize) -> PathBuf {
     p
 }
 
+fn write_texture_pack(
+    output: &Path,
+    pack: &MinecraftPack,
+    options: &MinecraftPackOptions,
+    atlases: Vec<TexturePackAtlasData>,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
+    if atlases.is_empty() {
+        return Err("atlas --minecraft: cannot write empty texture pack".into());
+    }
+
+    let icon_data = load_icon_blob(pack, options)?;
+    let name = options
+        .name
+        .clone()
+        .unwrap_or_else(|| default_pack_name(&pack.root));
+    let description = options
+        .description
+        .clone()
+        .or_else(|| pack_description(pack.pack_mcmeta.as_deref()))
+        .unwrap_or_default();
+
+    let mut blob_cursor = 0u64;
+    let mut icon = None;
+    if let Some(icon_data) = icon_data.as_ref() {
+        icon = Some(TexturePackBlob {
+            offset: blob_cursor,
+            len: icon_data.bytes.len() as u64,
+            format: icon_data.format.clone(),
+        });
+        blob_cursor = blob_cursor.saturating_add(icon_data.bytes.len() as u64);
+    }
+
+    let mut atlas_headers = Vec::with_capacity(atlases.len());
+    for (index, atlas) in atlases.iter().enumerate() {
+        atlas_headers.push(TexturePackAtlasBlob {
+            index: index as u32,
+            offset: blob_cursor,
+            len: atlas.bytes.len() as u64,
+            width: atlas.width,
+            height: atlas.height,
+            entries: u32::try_from(atlas.entries)
+                .map_err(|_| "atlas --minecraft: too many atlas entries")?,
+        });
+        blob_cursor = blob_cursor.saturating_add(atlas.bytes.len() as u64);
+    }
+
+    let mut header = TexturePackHeader {
+        kind: TEXTURE_PACK_KIND.to_owned(),
+        version: TEXTURE_PACK_HEADER_VERSION,
+        name,
+        description,
+        pack_mcmeta: pack.pack_mcmeta.clone(),
+        sidecars: pack.sidecars.clone(),
+        blob_section_offset: 0,
+        icon,
+        atlases: atlas_headers,
+    };
+
+    let mut header_bytes = rmp_serde::to_vec_named(&header)?;
+    let mut converged = false;
+    for _ in 0..8 {
+        let blob_section_offset = (TEXTURE_PACK_PREAMBLE_LEN + header_bytes.len()) as u64;
+        let mut absolute_cursor = blob_section_offset;
+        if let Some(icon) = header.icon.as_mut() {
+            icon.offset = absolute_cursor;
+            absolute_cursor = absolute_cursor.saturating_add(icon.len);
+        }
+        for atlas in &mut header.atlases {
+            atlas.offset = absolute_cursor;
+            absolute_cursor = absolute_cursor.saturating_add(atlas.len);
+        }
+        header.blob_section_offset = blob_section_offset;
+
+        let next = rmp_serde::to_vec_named(&header)?;
+        if next.len() == header_bytes.len() {
+            header_bytes = next;
+            converged = true;
+            break;
+        }
+        header_bytes = next;
+    }
+    if !converged {
+        return Err("atlas --minecraft: failed to stabilize vtp header layout".into());
+    }
+
+    let mut out = Vec::with_capacity(
+        TEXTURE_PACK_PREAMBLE_LEN
+            .saturating_add(header_bytes.len())
+            .saturating_add(blob_cursor as usize),
+    );
+    out.extend_from_slice(TEXTURE_PACK_MAGIC);
+    out.extend_from_slice(&TEXTURE_PACK_CONTAINER_VERSION.to_le_bytes());
+    out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_bytes);
+    if let Some(icon_data) = icon_data.as_ref() {
+        out.extend_from_slice(&icon_data.bytes);
+    }
+    for atlas in &atlases {
+        out.extend_from_slice(&atlas.bytes);
+    }
+
+    fs::write(output, &out)?;
+
+    if verbose {
+        println!(
+            "[vrawtex] VTP: wrote {} atlas blob(s), icon={}, header={} bytes, total={} bytes -> {}",
+            atlases.len(),
+            header.icon.is_some(),
+            header_bytes.len(),
+            out.len(),
+            output.display()
+        );
+    }
+
+    Ok(())
+}
+
 fn scale_dimension(value: u32, source_side: u32, target_side: u32) -> u32 {
     ((value as u64 * target_side as u64 + source_side as u64 / 2) / source_side as u64)
         .max(1)
@@ -847,14 +1167,19 @@ pub fn atlas_cmd(
     pad: Option<u32>,
     mipchain: Option<crate::mipchain::MipChainSpec>,
     pixel_format: crate::EncodePixelFormat,
-    minecraft: bool,
+    minecraft_options: Option<MinecraftPackOptions>,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let max_side = max_side.unwrap_or(DEFAULT_MAX_SIDE);
     let pad = pad.unwrap_or(DEFAULT_PAD);
-    let out_base = output.unwrap_or_else(|| PathBuf::from("./atlas.vrawtex"));
     let with_mipchain = mipchain.is_some();
+    let minecraft = minecraft_options.is_some();
     let minecraft_pack = minecraft.then(|| minecraft_pack(&inputs)).transpose()?;
+    let out_base = if let Some(pack) = minecraft_pack.as_ref() {
+        texture_pack_output_path(output, pack)
+    } else {
+        output.unwrap_or_else(|| PathBuf::from("./atlas.vrawtex"))
+    };
 
     if max_side > MAX_ATLAS_SIDE {
         return Err(format!(
@@ -956,6 +1281,8 @@ pub fn atlas_cmd(
             t_load.elapsed().as_secs_f64()
         );
     }
+
+    let mut texture_pack_atlases = Vec::new();
 
     // split loop
     let mut chunk_idx = 0usize;
@@ -1202,6 +1529,22 @@ pub fn atlas_cmd(
                 previous_side = side;
                 level_idx += 1;
             }
+        } else if minecraft {
+            if verbose {
+                println!(
+                    "[vrawtex] atlas: staging chosen chunk {} ({}x{}, entries={}) into VTP",
+                    chunk_idx,
+                    best_side,
+                    best_side,
+                    chunk_items.len()
+                );
+            }
+            texture_pack_atlases.push(TexturePackAtlasData {
+                width: best_side,
+                height: best_side,
+                entries: chunk_items.len(),
+                bytes: best_encoded,
+            });
         } else {
             if verbose {
                 println!(
@@ -1225,6 +1568,10 @@ pub fn atlas_cmd(
         // next chunk
         items = rest_items;
         chunk_idx += 1;
+    }
+
+    if let (Some(pack), Some(options)) = (minecraft_pack.as_ref(), minecraft_options.as_ref()) {
+        write_texture_pack(&out_base, pack, options, texture_pack_atlases, verbose)?;
     }
 
     Ok(())
@@ -1263,7 +1610,7 @@ mod tests {
             Some(1),
             crate::mipchain::MipChainSpec::from_cli(Some(0), Vec::new()).unwrap(),
             crate::EncodePixelFormat::Rgb8,
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -1304,7 +1651,7 @@ mod tests {
             Some(1),
             spec,
             crate::EncodePixelFormat::Rgba8,
-            false,
+            None,
             false,
         )
         .unwrap();
@@ -1335,6 +1682,9 @@ mod tests {
             r#"{"pack":{"description":"test","pack_format":1},"overlays":{"entries":[{"directory":"patch","formats":[1,99]}]}}"#,
         )
         .unwrap();
+        RgbaImage::from_pixel(2, 2, Rgba([200, 100, 50, 255]))
+            .save(root.join("pack.png"))
+            .unwrap();
 
         let texture = texture_dir.join("animated.png");
         RgbaImage::from_pixel(4, 8, Rgba([10, 20, 30, 255]))
@@ -1356,7 +1706,7 @@ mod tests {
             .save(overlay_texture_dir.join("animated.png"))
             .unwrap();
 
-        let out = root.join("atlas.vrawtex");
+        let out = root.join("pack.vtp");
         atlas_cmd(
             vec![root.clone()],
             Some(out.clone()),
@@ -1364,13 +1714,31 @@ mod tests {
             Some(1),
             None,
             crate::EncodePixelFormat::Rgba8,
-            true,
+            Some(MinecraftPackOptions {
+                name: Some("Fixture Pack".to_owned()),
+                description: Some("Tiny fixture".to_owned()),
+                icon: None,
+            }),
             false,
         )
         .unwrap();
 
         let bytes = fs::read(out).unwrap();
-        let parsed = crate::parse_container(&bytes, crate::DecodeSafety::Strict).unwrap();
+        let header = decode_texture_pack_header(&bytes).unwrap();
+        assert_eq!(header.kind, TEXTURE_PACK_KIND);
+        assert_eq!(header.name, "Fixture Pack");
+        assert_eq!(header.description, "Tiny fixture");
+        assert!(header.icon.is_some());
+        assert_eq!(header.sidecars.len(), 1);
+        assert_eq!(header.atlases.len(), 1);
+        assert!(header.atlases[0].offset > header.blob_section_offset);
+
+        let atlas = &header.atlases[0];
+        let atlas_start = atlas.offset as usize;
+        let atlas_end = atlas_start + atlas.len as usize;
+        let parsed =
+            crate::parse_container(&bytes[atlas_start..atlas_end], crate::DecodeSafety::Strict)
+                .unwrap();
         let meta = decode_minecraft_meta(parsed.meta_raw.as_deref().unwrap()).unwrap();
         assert_eq!(meta.kind, MINECRAFT_META_KIND);
         assert!(meta.pack_mcmeta.as_deref().unwrap().contains("\"pack\""));
@@ -1404,6 +1772,55 @@ mod tests {
             .unwrap();
         assert_eq!((base.source_width, base.source_height), (4, 8));
         assert!(base.mcmeta.as_deref().unwrap().contains("\"animation\""));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn minecraft_vtp_can_hold_multiple_atlas_blobs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vrawtex-minecraft-vtp-split-test-{unique}"));
+        let texture_dir = root.join("assets/example/textures/block");
+        fs::create_dir_all(&texture_dir).unwrap();
+        fs::write(
+            root.join("pack.mcmeta"),
+            r#"{"pack":{"description":"split","pack_format":1}}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255]))
+            .save(texture_dir.join("a.png"))
+            .unwrap();
+        RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]))
+            .save(texture_dir.join("b.png"))
+            .unwrap();
+
+        let out = root.join("split.vtp");
+        atlas_cmd(
+            vec![root.clone()],
+            Some(out.clone()),
+            Some(10),
+            Some(1),
+            None,
+            crate::EncodePixelFormat::Rgba8,
+            Some(MinecraftPackOptions::default()),
+            false,
+        )
+        .unwrap();
+
+        let bytes = fs::read(out).unwrap();
+        let header = decode_texture_pack_header(&bytes).unwrap();
+        assert_eq!(header.atlases.len(), 2);
+        assert_eq!(
+            header
+                .atlases
+                .iter()
+                .map(|atlas| atlas.entries)
+                .sum::<u32>(),
+            2
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

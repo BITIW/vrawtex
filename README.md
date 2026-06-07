@@ -104,16 +104,23 @@ cargo build --release
 ./target/release/vrawtex -v atlas --mipchain 4 --size 1080,720,240,32 assets/
 ```
 
-Упаковать текстуры Minecraft resource pack с resource locations и `.png.mcmeta`:
+Упаковать Minecraft resource pack в `.vtp`:
 
 ```bash
-./target/release/vrawtex -v atlas --minecraft -o faithful.vrawtex faithful/
+./target/release/vrawtex -v atlas --minecraft \
+  --name "Faithful 32x" \
+  --desc "The go-to 32x resource pack" \
+  --ico faithful/pack.png \
+  -o faithful.vtp \
+  faithful/
 ```
 
 ## Примечания
 
 - Команда `atlas` принимает как отдельные файлы, так и директории.
-- `atlas --minecraft` принимает ровно один корень resource pack, сканирует `assets/<namespace>/**/*.png` и объявленные в `pack.mcmeta` overlay-слои. В metadata сохраняются resource location, имя overlay, исходный размер, atlas rect, соседний `.png.mcmeta`, orphan `.png.mcmeta` без собственной текстуры и `pack.mcmeta`. Остальные файлы resource pack остаются обычными файлами для Minecraft ResourceManager.
+- `atlas --minecraft` принимает ровно один корень resource pack и пишет один `.vtp` контейнер: header с `name`/`description`/layout, icon blob и один или несколько VRAWTEX atlas blobs.
+- `--name`, `--desc` и `--ico` работают только вместе с `--minecraft`. Если `--ico` не задан, используется `pack.png`, если он есть. Если `--desc` не задан, описание берётся из `pack.mcmeta`.
+- Minecraft atlas blobs сканируют `assets/<namespace>/**/*.png` и объявленные в `pack.mcmeta` overlay-слои. В metadata сохраняются resource location, имя overlay, исходный размер, atlas rect, соседний `.png.mcmeta`, orphan `.png.mcmeta` без собственной текстуры и `pack.mcmeta`. Остальные файлы resource pack остаются обычными файлами для Minecraft ResourceManager.
 - `--minecraft` пока несовместим с `--mipchain` и `--rgb8`: mip-уровни анимированных frame-strip текстур нужно уменьшать покадрово, а RGB8 уничтожает используемую Minecraft прозрачность.
 - `--rgb8` доступен для `encode` и `atlas`; альфа при этом полностью выбрасывается.
 - `--mipchain N` создаёт `N` дополнительных уровней после `mip0`; без `N` цепочка строится полностью.
@@ -123,5 +130,5 @@ cargo build --release
 - Входные изображения: PNG, JPEG, BMP, TGA, TIFF, GIF и DNG.
 - DNG сначала проверяется на встроенный полноразмерный JPEG preview (часто встречается в Samsung/LinearRaw/JPEG XL DNG), затем декодируется встроенными Rust-декодерами; для некоторых mobile/LinearRaw DNG используется fallback через ImageMagick (`magick`), если он установлен в системе.
 - Для `decode` и `inspect` поддерживается `--safety strict|relaxed`.
-- Распознанные atlas/minecraft-atlas/mipchain-метаданные можно выгрузить через `--dump-meta`.
+- Распознанные vtp/atlas/minecraft-atlas/mipchain-метаданные можно выгрузить через `--dump-meta`.
 - Подробный режим включается через `-v` (Рекомендую к использованию, можно узнать много интересного)
