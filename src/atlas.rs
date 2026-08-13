@@ -1167,6 +1167,7 @@ pub fn atlas_cmd(
     pad: Option<u32>,
     mipchain: Option<crate::mipchain::MipChainSpec>,
     pixel_format: crate::EncodePixelFormat,
+    profile: crate::CompressionProfile,
     minecraft_options: Option<MinecraftPackOptions>,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -1191,12 +1192,14 @@ pub fn atlas_cmd(
 
     if verbose {
         println!(
-            "[vrawtex] Atlas build: inputs={}, max_side={}, pad={}, mipchain={}, minecraft={}, out_base={}",
+            "[vrawtex] Atlas build: inputs={}, max_side={}, pad={}, mipchain={}, minecraft={}, profile={}, zstd_level={}, out_base={}",
             inputs.len(),
             max_side,
             pad,
             with_mipchain,
             minecraft,
+            profile.as_str(),
+            profile.zstd_level(),
             out_base.display()
         );
     }
@@ -1371,6 +1374,7 @@ pub fn atlas_cmd(
                 &atlas_img,
                 Some(&meta),
                 pixel_format,
+                profile,
                 false, // verbose для теста
                 None,
                 std::time::Instant::now(),
@@ -1524,6 +1528,7 @@ pub fn atlas_cmd(
                     Some(&meta),
                     &out_path,
                     pixel_format,
+                    profile,
                     verbose,
                 )?;
                 previous_side = side;
@@ -1610,6 +1615,7 @@ mod tests {
             Some(1),
             crate::mipchain::MipChainSpec::from_cli(Some(0), Vec::new()).unwrap(),
             crate::EncodePixelFormat::Rgb8,
+            crate::CompressionProfile::Balance,
             None,
             false,
         )
@@ -1651,6 +1657,7 @@ mod tests {
             Some(1),
             spec,
             crate::EncodePixelFormat::Rgba8,
+            crate::CompressionProfile::Balance,
             None,
             false,
         )
@@ -1714,6 +1721,7 @@ mod tests {
             Some(1),
             None,
             crate::EncodePixelFormat::Rgba8,
+            crate::CompressionProfile::Balance,
             Some(MinecraftPackOptions {
                 name: Some("Fixture Pack".to_owned()),
                 description: Some("Tiny fixture".to_owned()),
@@ -1805,6 +1813,7 @@ mod tests {
             Some(1),
             None,
             crate::EncodePixelFormat::Rgba8,
+            crate::CompressionProfile::Balance,
             Some(MinecraftPackOptions::default()),
             false,
         )

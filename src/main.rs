@@ -25,9 +25,8 @@ const VIEWER_MIN_SCALE: f64 = 0.01;
 const VIEWER_ZOOM_STEP: f64 = 1.20;
 const VIEWER_KEY_PAN_PIXELS: f64 = 80.0;
 
-const ZSTD_LEVEL: i32 = 10;
 const AUTO_SELECT_ZSTD_LEVEL: i32 = 3;
-const ZSTD_WORKERS_TOTAL: u32 = 8;
+const ZSTD_WORKERS_MAX: u32 = 16;
 const CHUNK_TARGET: usize = 128 * 1024;
 const PLANE_PAR_CHUNK: usize = 256 * 1024;
 const PREDICTOR_SAMPLE_BYTES: usize = 256 * 1024;
@@ -101,6 +100,35 @@ enum ContainerFormat {
 pub(crate) enum EncodePixelFormat {
     Rgba8,
     Rgb8,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CompressionProfile {
+    Fast,
+    #[default]
+    Balance,
+    Compact,
+    Ultra,
+}
+
+impl CompressionProfile {
+    pub(crate) fn zstd_level(self) -> i32 {
+        match self {
+            CompressionProfile::Fast => 8,
+            CompressionProfile::Balance => 10,
+            CompressionProfile::Compact => 16,
+            CompressionProfile::Ultra => 22,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CompressionProfile::Fast => "fast",
+            CompressionProfile::Balance => "balance",
+            CompressionProfile::Compact => "compact",
+            CompressionProfile::Ultra => "ultra",
+        }
+    }
 }
 
 impl EncodePixelFormat {
@@ -186,6 +214,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             output,
             recursive,
             rgb8,
+            profile,
             mipchain,
             size,
         } => {
@@ -200,6 +229,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 } else {
                     EncodePixelFormat::Rgba8
                 },
+                profile,
                 cli.verbose,
             )
         }
@@ -226,6 +256,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             max_side,
             pad,
             rgb8,
+            profile,
             mipchain,
             size,
             minecraft,
@@ -268,6 +299,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 } else {
                     EncodePixelFormat::Rgba8
                 },
+                profile,
                 minecraft_options,
                 cli.verbose,
             )
@@ -324,6 +356,10 @@ enum Command {
         /// Store RGB8 and discard alpha
         #[arg(long = "rgb8")]
         rgb8: bool,
+
+        /// Compression profile: fast (zstd 8), balance (10), compact (16)
+        #[arg(long = "profile", value_enum, default_value = "balance")]
+        profile: CompressionProfile,
 
         /// Build mipchain; optional value limits additional levels after mip0
         #[arg(long = "mipchain", num_args = 0..=1, default_missing_value = "0", value_name = "LEVELS")]
@@ -400,6 +436,10 @@ enum Command {
         /// Store RGB8 and discard alpha
         #[arg(long = "rgb8")]
         rgb8: bool,
+
+        /// Compression profile: fast (zstd 8), balance (10), compact (16)
+        #[arg(long = "profile", value_enum, default_value = "balance")]
+        profile: CompressionProfile,
 
         /// Emit atlas_mip0, atlas_mip1, ...; optional value limits levels after mip0
         #[arg(long = "mipchain", num_args = 0..=1, default_missing_value = "0", value_name = "LEVELS")]
@@ -1673,24 +1713,27 @@ fn choose_predictor_for_channel_sample_with_transform(
     channel: usize,
     color_transform: ColorTransform,
 ) -> Result<ChannelAutoChoice, Box<dyn Error>> {
-    let mut evals: Vec<PredictorEval> = Vec::with_capacity(predictor_candidates().len());
-
-    for candidate in predictor_candidates() {
-        let sample = collect_channel_sample(
-            rgba_bytes,
-            width,
-            height,
-            channel,
-            color_transform,
-            candidate,
-            PREDICTOR_SAMPLE_BYTES,
-        );
-        let comp = bulk::compress(&sample, AUTO_SELECT_ZSTD_LEVEL)?;
-        evals.push(PredictorEval {
-            predictor: candidate,
-            size: comp.len(),
-        });
-    }
+    let evals = predictor_candidates()
+        .into_par_iter()
+        .map(|candidate| -> Result<PredictorEval, String> {
+            let sample = collect_channel_sample(
+                rgba_bytes,
+                width,
+                height,
+                channel,
+                color_transform,
+                candidate,
+                PREDICTOR_SAMPLE_BYTES,
+            );
+            let comp = bulk::compress(&sample, AUTO_SELECT_ZSTD_LEVEL)
+                .map_err(|error| error.to_string())?;
+            Ok(PredictorEval {
+                predictor: candidate,
+                size: comp.len(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
 
     let (chosen, chosen_size) = choose_channel_predictor_from_evals(&evals)?;
     Ok(ChannelAutoChoice {
@@ -1705,31 +1748,33 @@ fn choose_color_transform_and_predictors(
     width: usize,
     height: usize,
 ) -> Result<(ColorTransform, [Predictor; 3], Vec<RgbTransformChoice>), Box<dyn Error>> {
-    let mut decisions: Vec<RgbTransformChoice> =
-        Vec::with_capacity(color_transform_candidates().len());
-
-    for color_transform in color_transform_candidates() {
-        let mut total_size = 0usize;
-        let mut channels: Vec<ChannelAutoChoice> = Vec::with_capacity(3);
-
-        for channel in 0..3 {
-            let choice = choose_predictor_for_channel_sample_with_transform(
-                rgba_bytes,
-                width,
-                height,
-                channel,
-                color_transform,
-            )?;
-            total_size = total_size.saturating_add(choice.chosen_size);
-            channels.push(choice);
-        }
-
-        decisions.push(RgbTransformChoice {
-            transform: color_transform,
-            total_size,
-            channels,
-        });
-    }
+    let decisions = color_transform_candidates()
+        .into_par_iter()
+        .map(|color_transform| -> Result<RgbTransformChoice, String> {
+            let channels = (0..3usize)
+                .into_par_iter()
+                .map(|channel| {
+                    choose_predictor_for_channel_sample_with_transform(
+                        rgba_bytes,
+                        width,
+                        height,
+                        channel,
+                        color_transform,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let total_size = channels.iter().fold(0usize, |total, choice| {
+                total.saturating_add(choice.chosen_size)
+            });
+            Ok(RgbTransformChoice {
+                transform: color_transform,
+                total_size,
+                channels,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
 
     let best_idx = decisions
         .iter()
@@ -1778,16 +1823,24 @@ fn encode_cmd(
     recursive: bool,
     mipchain: Option<mipchain::MipChainSpec>,
     pixel_format: EncodePixelFormat,
+    profile: CompressionProfile,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     if input.is_dir() {
         if !recursive {
             return Err("input is a directory; use -r/--recursive to process it".into());
         }
-        encode_dir(&input, mipchain.as_ref(), pixel_format, verbose)
+        encode_dir(&input, mipchain.as_ref(), pixel_format, profile, verbose)
     } else {
         let out_path = output.unwrap_or_else(|| default_encode_output_path(&input));
-        encode_one(&input, &out_path, mipchain.as_ref(), pixel_format, verbose)
+        encode_one(
+            &input,
+            &out_path,
+            mipchain.as_ref(),
+            pixel_format,
+            profile,
+            verbose,
+        )
     }
 }
 
@@ -1795,6 +1848,7 @@ fn encode_dir(
     root: &Path,
     mipchain: Option<&mipchain::MipChainSpec>,
     pixel_format: EncodePixelFormat,
+    profile: CompressionProfile,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     if verbose {
@@ -1848,7 +1902,7 @@ fn encode_dir(
             fs::create_dir_all(parent_dir)?;
         }
 
-        match encode_one(path, &out_path, mipchain, pixel_format, verbose) {
+        match encode_one(path, &out_path, mipchain, pixel_format, profile, verbose) {
             Ok(_) => processed += 1,
             Err(e) => {
                 failed += 1;
@@ -1874,6 +1928,7 @@ fn encode_one(
     out_path: &Path,
     mipchain: Option<&mipchain::MipChainSpec>,
     pixel_format: EncodePixelFormat,
+    profile: CompressionProfile,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
@@ -1911,6 +1966,7 @@ fn encode_one(
             &built.image,
             Some(&built.meta_bytes),
             pixel_format,
+            profile,
             verbose,
             Some(original_size),
             start_total,
@@ -1920,6 +1976,7 @@ fn encode_one(
             &rgba,
             None,
             pixel_format,
+            profile,
             verbose,
             Some(original_size),
             start_total,
@@ -1973,6 +2030,13 @@ fn split_workers(workers_total: u32, streams: usize) -> Vec<u32> {
     out
 }
 
+fn zstd_workers_total() -> u32 {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get() as u32)
+        .unwrap_or(1)
+        .clamp(1, ZSTD_WORKERS_MAX)
+}
+
 #[inline(always)]
 fn worker_for_stream(workers_split: &[u32], stream_idx: usize) -> u32 {
     if workers_split.is_empty() {
@@ -1989,12 +2053,14 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     rgba: &RgbaImage,
     meta: Option<&[u8]>,
     pixel_format: EncodePixelFormat,
+    profile: CompressionProfile,
     verbose: bool,
     original_size_opt: Option<u64>,
     start_total: Instant,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let (width, height) = rgba.dimensions();
     let rgba_bytes = rgba.as_raw();
+    let zstd_level = profile.zstd_level();
 
     let width_usize = width as usize;
     let height_usize = height as usize;
@@ -2035,8 +2101,10 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     let store_alpha_stream = chans == 4
         && !(alpha_mode == AlphaMode::Opaque255 || alpha_mode == AlphaMode::Transparent0);
     let stored_streams = 3usize + usize::from(store_alpha_stream);
-    let ws = split_workers(ZSTD_WORKERS_TOTAL, stored_streams);
+    let workers_total = zstd_workers_total();
+    let ws = split_workers(workers_total, stored_streams);
 
+    let start_auto_select = Instant::now();
     let (color_transform, rgb_predictors, transform_choices) =
         choose_color_transform_and_predictors(rgba_bytes, width_usize, height_usize)?;
     let mut stream_predictors = vec![Predictor::None; stored_streams];
@@ -2054,12 +2122,17 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     } else {
         None
     };
+    let auto_select_elapsed = start_auto_select.elapsed();
     if let Some(choice) = alpha_choice.as_ref() {
         stream_predictors[3] = choice.chosen;
     }
     let has_predictor = stream_predictors.iter().any(|&p| p != Predictor::None);
 
     if verbose {
+        println!(
+            "[vrawtex] Auto-select time: {}",
+            format_duration_ns(auto_select_elapsed)
+        );
         let mut transform_scores: Vec<String> = Vec::with_capacity(transform_choices.len());
         for choice in &transform_choices {
             transform_scores.push(format!(
@@ -2102,15 +2175,15 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     let dimmask = build_dimmask(width, height);
 
     // --- ZSTD streaming ---
-    let mut enc_r = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+    let mut enc_r = Encoder::new(Vec::new(), zstd_level)?;
     enc_r.multithread(worker_for_stream(&ws, 0))?;
     enc_r.set_pledged_src_size(Some(plane_size_u64))?;
 
-    let mut enc_g = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+    let mut enc_g = Encoder::new(Vec::new(), zstd_level)?;
     enc_g.multithread(worker_for_stream(&ws, 1))?;
     enc_g.set_pledged_src_size(Some(plane_size_u64))?;
 
-    let mut enc_b = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+    let mut enc_b = Encoder::new(Vec::new(), zstd_level)?;
     enc_b.multithread(worker_for_stream(&ws, 2))?;
     enc_b.set_pledged_src_size(Some(plane_size_u64))?;
 
@@ -2121,7 +2194,7 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
         } else {
             plane_size_u64
         };
-        let mut enc_a = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+        let mut enc_a = Encoder::new(Vec::new(), zstd_level)?;
         enc_a.multithread(worker_for_stream(&ws, 3))?;
         enc_a.set_pledged_src_size(Some(pledged))?;
         enc_a_opt = Some(enc_a);
@@ -2466,16 +2539,17 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
 
     if verbose {
         println!(
-            "[vrawtex] Features: pixel_format={}, predictor={}, alpha_mode={:?}, has_meta={}, color_transform={}, chunk={} bytes, zstd_level={}, auto_select_zstd_level={}, workers_total={} (split={:?})",
+            "[vrawtex] Features: pixel_format={}, predictor={}, alpha_mode={:?}, has_meta={}, color_transform={}, chunk={} bytes, profile={}, zstd_level={}, auto_select_zstd_level={}, workers_total={} (split={:?})",
             pixel_format.as_str(),
             has_predictor,
             alpha_mode,
             has_meta,
             color_transform.as_str(),
             CHUNK_TARGET,
-            ZSTD_LEVEL,
+            profile.as_str(),
+            zstd_level,
             AUTO_SELECT_ZSTD_LEVEL,
-            ZSTD_WORKERS_TOTAL,
+            workers_total,
             ws
         );
 
@@ -2548,11 +2622,19 @@ pub(crate) fn encode_rgba8_with_meta_to_file(
     meta: Option<&[u8]>,
     out_path: &Path,
     pixel_format: EncodePixelFormat,
+    profile: CompressionProfile,
     verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let start_total = Instant::now();
-    let bytes =
-        encode_rgba8_with_meta_to_vec(rgba, meta, pixel_format, verbose, None, start_total)?;
+    let bytes = encode_rgba8_with_meta_to_vec(
+        rgba,
+        meta,
+        pixel_format,
+        profile,
+        verbose,
+        None,
+        start_total,
+    )?;
     fs::write(out_path, &bytes)?;
     Ok(())
 }
@@ -3595,6 +3677,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn documented_encode_command_parses() {
+        let cli = Cli::try_parse_from(["vrawtex", "-v", "encode", "example.png"]).unwrap();
+        assert!(cli.verbose);
+        match cli.command {
+            Command::Encode {
+                input,
+                output,
+                profile,
+                ..
+            } => {
+                assert_eq!(input, PathBuf::from("example.png"));
+                assert!(output.is_none());
+                assert_eq!(profile, CompressionProfile::Balance);
+            }
+            _ => panic!("expected encode command"),
+        }
+    }
+
+    #[test]
+    fn compression_profiles_map_to_documented_zstd_levels() {
+        assert_eq!(CompressionProfile::Fast.zstd_level(), 8);
+        assert_eq!(CompressionProfile::Balance.zstd_level(), 10);
+        assert_eq!(CompressionProfile::Compact.zstd_level(), 16);
+        assert_eq!(CompressionProfile::Ultra.zstd_level(), 22);
+
+        let cli =
+            Cli::try_parse_from(["vrawtex", "atlas", "--profile", "compact", "assets"]).unwrap();
+        match cli.command {
+            Command::Atlas { profile, .. } => {
+                assert_eq!(profile, CompressionProfile::Compact);
+            }
+            _ => panic!("expected atlas command"),
+        }
+    }
+
+    #[test]
+    fn all_compression_profiles_roundtrip() {
+        let rgba = RgbaImage::from_fn(32, 24, |x, y| {
+            image::Rgba([
+                (x.wrapping_mul(7) + y) as u8,
+                (x + y.wrapping_mul(5)) as u8,
+                (x ^ y) as u8,
+                ((x * 17 + y * 11) & 0xff) as u8,
+            ])
+        });
+
+        for profile in [
+            CompressionProfile::Fast,
+            CompressionProfile::Balance,
+            CompressionProfile::Compact,
+            CompressionProfile::Ultra,
+        ] {
+            let encoded = encode_rgba8_with_meta_to_vec(
+                &rgba,
+                None,
+                EncodePixelFormat::Rgba8,
+                profile,
+                false,
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+            let parsed = parse_container(&encoded, DecodeSafety::Strict).unwrap();
+            let (planes, _, _, _) =
+                decode_container_to_planes(&parsed, &encoded, DecodeSafety::Strict, true).unwrap();
+
+            for (index, pixel) in rgba.pixels().enumerate() {
+                for channel in 0..4 {
+                    assert_eq!(planes[channel][index], pixel.0[channel], "{profile:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bare_mipchain_flag_does_not_consume_input_path() {
         let args = normalize_mipchain_args(
             ["vrawtex", "encode", "--mipchain", "input.png"]
@@ -3614,6 +3771,30 @@ mod tests {
         );
         assert_eq!(args[2], "--mipchain");
         assert_eq!(args[3], "4");
+    }
+
+    #[test]
+    fn zstd_worker_budget_is_bounded() {
+        let workers = zstd_workers_total();
+        assert!((1..=ZSTD_WORKERS_MAX).contains(&workers));
+    }
+
+    #[test]
+    fn parallel_auto_select_is_deterministic() {
+        let rgba = RgbaImage::from_fn(64, 48, |x, y| {
+            image::Rgba([
+                (x.wrapping_mul(7) + y.wrapping_mul(3)) as u8,
+                (x.wrapping_mul(2) + y.wrapping_mul(11)) as u8,
+                (x ^ y) as u8,
+                255,
+            ])
+        });
+
+        let first = choose_color_transform_and_predictors(rgba.as_raw(), 64, 48).unwrap();
+        let second = choose_color_transform_and_predictors(rgba.as_raw(), 64, 48).unwrap();
+
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
     }
 
     #[test]
@@ -3710,6 +3891,7 @@ mod tests {
             &rgba,
             None,
             EncodePixelFormat::Rgb8,
+            CompressionProfile::Balance,
             false,
             None,
             Instant::now(),
@@ -3743,6 +3925,7 @@ mod tests {
             &rgba,
             None,
             EncodePixelFormat::Rgba8,
+            CompressionProfile::Balance,
             false,
             None,
             Instant::now(),
@@ -3770,6 +3953,7 @@ mod tests {
             &built.image,
             Some(&built.meta_bytes),
             EncodePixelFormat::Rgba8,
+            CompressionProfile::Balance,
             false,
             None,
             Instant::now(),

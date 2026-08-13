@@ -4,6 +4,8 @@
 
 Текущий пайплайн основан на planar `U8` каналах, быстрых обратимых transform/predictor шагах и `zstd`.
 
+Полная бинарная спецификация VRAWTEX v2 и VTP v1: [format.md](format.md).
+
 ## Сборка
 
 ```bash
@@ -23,6 +25,20 @@ cargo build --release
 ```bash
 ./target/release/vrawtex encode input.png
 ```
+
+Выбрать профиль сжатия:
+
+```bash
+./target/release/vrawtex encode --profile fast input.png
+./target/release/vrawtex encode --profile balance input.png
+./target/release/vrawtex encode --profile compact input.png
+```
+
+| Профиль | Zstd | Назначение |
+|---|---:|---|
+| `fast` | 8 | Максимальная скорость упаковки |
+| `balance` | 10 | Баланс скорости и размера, используется по умолчанию |
+| `compact` | 16 | Минимальный размер ценой заметно более долгой упаковки |
 
 Отбросить альфа-канал и сохранить RGB8:
 
@@ -123,6 +139,7 @@ cargo build --release
 - Minecraft atlas blobs сканируют `assets/<namespace>/**/*.png` и объявленные в `pack.mcmeta` overlay-слои. В metadata сохраняются resource location, имя overlay, исходный размер, atlas rect, соседний `.png.mcmeta`, orphan `.png.mcmeta` без собственной текстуры и `pack.mcmeta`. Остальные файлы resource pack остаются обычными файлами для Minecraft ResourceManager.
 - `--minecraft` пока несовместим с `--mipchain` и `--rgb8`: mip-уровни анимированных frame-strip текстур нужно уменьшать покадрово, а RGB8 уничтожает используемую Minecraft прозрачность.
 - `--rgb8` доступен для `encode` и `atlas`; альфа при этом полностью выбрасывается.
+- `--profile fast|balance|compact` доступен для `encode` и `atlas`, включая recursive encode, mipchain и Minecraft VTP. Профиль меняет только уровень Zstd и не влияет на совместимость декодера.
 - `--mipchain N` создаёт `N` дополнительных уровней после `mip0`; без `N` цепочка строится полностью.
 - `--size` задаёт размеры дополнительных уровней и требует такое же количество значений, как в `--mipchain N`. Значения должны строго уменьшаться и быть меньше оригинала.
 - Mip-уровни уменьшаются последовательно до `1x1` через integer Lanczos с радиусом 100% от меньшей стороны предыдущего уровня.
