@@ -1,5 +1,9 @@
-use image::RgbaImage;
+use image::{ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
+
+use lanczos_ultra::Resizer;
+
+pub const MIPCHAIN_LANCZOS_RADIUS_PERCENT: u32 = 50;
 
 // ===== Fixed-point Q32.32 =====
 pub type Fixed = i64;
@@ -41,6 +45,11 @@ fn q_to_u8_from_acc_i64(acc: i64) -> u8 {
     } else {
         v as u8
     }
+}
+
+#[inline(always)]
+fn q_to_u16_from_acc_i128(acc: i128) -> u16 {
+    (acc >> FRAC_BITS).clamp(0, u16::MAX as i128) as u16
 }
 
 // ===== Integer-only sin / sinc / Lanczos =====
@@ -224,10 +233,46 @@ pub fn resize_lanczos_rgba_percent(
     radius_percent: u32,
 ) -> (RgbaImage, ResizeStats) {
     let (src_w, src_h) = src.dimensions();
-    let radius_q = radius_percent_q(src_w, src_h, radius_percent.max(1));
-    resize_lanczos_rgba_fixed(src, dst_w, dst_h, radius_q)
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        panic!("lanczos resize requires non-zero dimensions");
+    }
+    if src_w == dst_w && src_h == dst_h {
+        return (
+            src.clone(),
+            ResizeStats {
+                taps_total: 0,
+                ops_total: 0,
+            },
+        );
+    }
+
+    let plan = match Resizer::with_radius_percent(
+        src_w,
+        src_h,
+        dst_w,
+        dst_h,
+        radius_percent.max(1).min(100),
+    ) {
+        Ok(plan) => plan,
+        Err(err) => panic!("lanczos-ultra setup failed: {err}"),
+    };
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    if let Err(err) = plan.resize_into(src.as_raw(), &mut out) {
+        panic!("lanczos-ultra resize failed: {err}");
+    }
+
+    let taps_total = plan.sample_count();
+    let out = RgbaImage::from_raw(dst_w, dst_h, out).expect("lanczos-ultra output dimensions");
+    (
+        out,
+        ResizeStats {
+            taps_total,
+            ops_total: taps_total.saturating_mul(8),
+        },
+    )
 }
 
+#[allow(dead_code)]
 fn resize_lanczos_rgba_fixed(
     src: &RgbaImage,
     dst_w: u32,
@@ -339,6 +384,93 @@ fn resize_lanczos_rgba_fixed(
         ops_total,
     };
     (out, stats)
+}
+
+type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+/// Integer Lanczos for native RGBA16 samples, using the same kernels as RGBA8.
+pub fn resize_lanczos_rgba16_percent(
+    src: &Rgba16Image,
+    dst_w: u32,
+    dst_h: u32,
+    radius_percent: u32,
+) -> (Rgba16Image, ResizeStats) {
+    let (src_w, src_h) = src.dimensions();
+    let radius_q = radius_percent_q(src_w, src_h, radius_percent.max(1));
+    assert!(src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0);
+    if src_w == dst_w && src_h == dst_h {
+        return (
+            src.clone(),
+            ResizeStats {
+                taps_total: 0,
+                ops_total: 0,
+            },
+        );
+    }
+
+    let kernels_x = build_kernels_1d(src_w, dst_w, radius_q);
+    let taps_x_per_row: u64 = kernels_x.iter().map(|k| k.weights_q.len() as u64).sum();
+    let row_stride_src = src_w as usize * 4;
+    let row_stride_tmp = dst_w as usize * 4;
+    let mut tmp = vec![0u16; row_stride_tmp * src_h as usize];
+    tmp.par_chunks_mut(row_stride_tmp)
+        .enumerate()
+        .for_each(|(row, dst_row)| {
+            let source_row = &src.as_raw()[row * row_stride_src..(row + 1) * row_stride_src];
+            for (x, kernel) in kernels_x.iter().enumerate() {
+                let mut sums = [0i128; 4];
+                for (&index, &weight) in kernel.indices.iter().zip(&kernel.weights_q) {
+                    let source_offset = index as usize * 4;
+                    for channel in 0..4 {
+                        sums[channel] += source_value(source_offset, channel, source_row, weight);
+                    }
+                }
+                let target = x * 4;
+                for channel in 0..4 {
+                    dst_row[target + channel] = q_to_u16_from_acc_i128(sums[channel]);
+                }
+            }
+        });
+
+    let kernels_y = build_kernels_1d(src_h, dst_h, radius_q);
+    let taps_y_per_col: u64 = kernels_y.iter().map(|k| k.weights_q.len() as u64).sum();
+    let mut out = vec![0u16; row_stride_tmp * dst_h as usize];
+    out.par_chunks_mut(row_stride_tmp)
+        .enumerate()
+        .for_each_init(
+            || vec![0i128; row_stride_tmp],
+            |sums, (dst_y, dst_row)| {
+                sums.fill(0);
+                for (&src_y, &weight) in kernels_y[dst_y]
+                    .indices
+                    .iter()
+                    .zip(&kernels_y[dst_y].weights_q)
+                {
+                    let source = &tmp
+                        [src_y as usize * row_stride_tmp..(src_y as usize + 1) * row_stride_tmp];
+                    for (sum, &sample) in sums.iter_mut().zip(source) {
+                        *sum += sample as i128 * weight as i128;
+                    }
+                }
+                for (sample, &sum) in dst_row.iter_mut().zip(sums.iter()) {
+                    *sample = q_to_u16_from_acc_i128(sum);
+                }
+            },
+        );
+
+    let taps_total = taps_x_per_row * src_h as u64 + taps_y_per_col * dst_w as u64;
+    (
+        Rgba16Image::from_raw(dst_w, dst_h, out).expect("RGBA16 Lanczos output dimensions"),
+        ResizeStats {
+            taps_total,
+            ops_total: taps_total * 8,
+        },
+    )
+}
+
+#[inline(always)]
+fn source_value(offset: usize, channel: usize, source: &[u16], weight: i64) -> i128 {
+    source[offset + channel] as i128 * weight as i128
 }
 
 /// Edge-signature для edgecost.

@@ -1,5 +1,5 @@
 use crate::lanczos::{self, ResizeStats};
-use image::{Rgba, RgbaImage};
+use image::{ImageBuffer, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
@@ -171,6 +171,15 @@ pub struct MipChainAtlas {
     pub resize_stats: ResizeStats,
 }
 
+pub type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+pub struct MipChainAtlas16 {
+    pub image: Rgba16Image,
+    pub meta: MipChainMeta,
+    pub meta_bytes: Vec<u8>,
+    pub resize_stats: ResizeStats,
+}
+
 #[derive(Clone, Copy)]
 struct Placement {
     level: u16,
@@ -296,15 +305,18 @@ fn layout_score(layout: &Layout) -> (u32, u64, u32) {
     )
 }
 
-fn blit_with_padding(atlas: &mut RgbaImage, level: &RgbaImage, placement: Placement, pad: u32) {
-    let atlas_w = atlas.width() as usize;
+fn blit_samples_with_padding<T: Copy>(
+    dst: &mut [T],
+    atlas_w: usize,
+    src: &[T],
+    placement: Placement,
+    pad: u32,
+) {
     let src_w = placement.w as usize;
     let src_h = placement.h as usize;
     let x = placement.x as usize;
     let y = placement.y as usize;
     let pad = pad as usize;
-    let src = level.as_raw();
-    let dst: &mut [u8] = atlas.as_flat_samples_mut().samples;
     let pixel_index = |px: usize, py: usize| (py * atlas_w + px) * 4;
 
     for row in 0..src_h {
@@ -325,18 +337,8 @@ fn blit_with_padding(atlas: &mut RgbaImage, level: &RgbaImage, placement: Placem
         for row in 0..src_h {
             let left_src = pixel_index(x, y + row);
             let right_src = pixel_index(x + src_w - 1, y + row);
-            let left = [
-                dst[left_src],
-                dst[left_src + 1],
-                dst[left_src + 2],
-                dst[left_src + 3],
-            ];
-            let right = [
-                dst[right_src],
-                dst[right_src + 1],
-                dst[right_src + 2],
-                dst[right_src + 3],
-            ];
+            let left = dst[left_src..left_src + 4].to_vec();
+            let right = dst[right_src..right_src + 4].to_vec();
             let left_dst = pixel_index(x - offset, y + row);
             let right_dst = pixel_index(x + src_w - 1 + offset, y + row);
             dst[left_dst..left_dst + 4].copy_from_slice(&left);
@@ -351,18 +353,40 @@ fn blit_with_padding(atlas: &mut RgbaImage, level: &RgbaImage, placement: Placem
                 for corner_x in [x - dx, x + src_w - 1 + dx] {
                     let source_x = if corner_x < x { x } else { x + src_w - 1 };
                     let source = pixel_index(source_x, source_y);
-                    let color = [
-                        dst[source],
-                        dst[source + 1],
-                        dst[source + 2],
-                        dst[source + 3],
-                    ];
+                    let color = dst[source..source + 4].to_vec();
                     let target = pixel_index(corner_x, corner_y);
                     dst[target..target + 4].copy_from_slice(&color);
                 }
             }
         }
     }
+}
+
+fn blit_with_padding(atlas: &mut RgbaImage, level: &RgbaImage, placement: Placement, pad: u32) {
+    let atlas_width = atlas.width() as usize;
+    blit_samples_with_padding(
+        atlas.as_flat_samples_mut().samples,
+        atlas_width,
+        level.as_raw(),
+        placement,
+        pad,
+    );
+}
+
+fn blit_with_padding16(
+    atlas: &mut Rgba16Image,
+    level: &Rgba16Image,
+    placement: Placement,
+    pad: u32,
+) {
+    let atlas_width = atlas.width() as usize;
+    blit_samples_with_padding(
+        atlas.as_flat_samples_mut().samples,
+        atlas_width,
+        level.as_raw(),
+        placement,
+        pad,
+    );
 }
 
 fn meta_from_layout(layout: &Layout, pad: u32) -> Result<MipChainMeta, Box<dyn Error>> {
@@ -433,15 +457,17 @@ pub fn build_single_atlas(
 
     let mut image = RgbaImage::from_pixel(layout.width, layout.height, Rgba([0, 0, 0, 0]));
     blit_with_padding(&mut image, src, layout.placements[0], MIPCHAIN_PAD);
-
-    let mut previous: Option<RgbaImage> = None;
     let mut resize_stats = ResizeStats {
         taps_total: 0,
         ops_total: 0,
     };
     for (level_idx, &(dst_w, dst_h)) in level_sizes.iter().enumerate().skip(1) {
-        let source = previous.as_ref().unwrap_or(src);
-        let (next, stats) = lanczos::resize_lanczos_rgba_percent(source, dst_w, dst_h, 100);
+        let (next, stats) = lanczos::resize_lanczos_rgba_percent(
+            src,
+            dst_w,
+            dst_h,
+            lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
+        );
         resize_stats.taps_total = resize_stats.taps_total.saturating_add(stats.taps_total);
         resize_stats.ops_total = resize_stats.ops_total.saturating_add(stats.ops_total);
         blit_with_padding(
@@ -450,12 +476,68 @@ pub fn build_single_atlas(
             layout.placements[level_idx],
             MIPCHAIN_PAD,
         );
-        previous = Some(next);
     }
 
     let meta = meta_from_layout(&layout, MIPCHAIN_PAD)?;
     let meta_bytes = encode_meta(&meta)?;
     Ok(MipChainAtlas {
+        image,
+        meta,
+        meta_bytes,
+        resize_stats,
+    })
+}
+
+pub fn build_single_atlas16(
+    src: &Rgba16Image,
+    max_side: u32,
+    spec: &MipChainSpec,
+) -> Result<MipChainAtlas16, Box<dyn Error>> {
+    let mut level_sizes = vec![src.dimensions()];
+    level_sizes.extend(spec.target_dimensions(src.width(), src.height())?);
+
+    let right = layout_right(&level_sizes, MIPCHAIN_PAD)?;
+    let bottom = layout_bottom(&level_sizes, MIPCHAIN_PAD)?;
+    let layout = if layout_score(&right) <= layout_score(&bottom) {
+        right
+    } else {
+        bottom
+    };
+    if layout.width > max_side || layout.height > max_side {
+        return Err(format!(
+            "mipchain atlas {}x{} exceeds supported max side {}",
+            layout.width, layout.height, max_side
+        )
+        .into());
+    }
+
+    let mut image =
+        Rgba16Image::from_pixel(layout.width, layout.height, Rgba([0u16, 0u16, 0u16, 0u16]));
+    blit_with_padding16(&mut image, src, layout.placements[0], MIPCHAIN_PAD);
+    let mut resize_stats = ResizeStats {
+        taps_total: 0,
+        ops_total: 0,
+    };
+    for (level_idx, &(dst_w, dst_h)) in level_sizes.iter().enumerate().skip(1) {
+        let (next, stats) = lanczos::resize_lanczos_rgba16_percent(
+            src,
+            dst_w,
+            dst_h,
+            lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
+        );
+        resize_stats.taps_total = resize_stats.taps_total.saturating_add(stats.taps_total);
+        resize_stats.ops_total = resize_stats.ops_total.saturating_add(stats.ops_total);
+        blit_with_padding16(
+            &mut image,
+            &next,
+            layout.placements[level_idx],
+            MIPCHAIN_PAD,
+        );
+    }
+
+    let meta = meta_from_layout(&layout, MIPCHAIN_PAD)?;
+    let meta_bytes = encode_meta(&meta)?;
+    Ok(MipChainAtlas16 {
         image,
         meta,
         meta_bytes,
@@ -480,6 +562,39 @@ mod tests {
         assert!(built.image.width() <= 64);
         assert!(built.image.height() <= 64);
         assert_eq!(decode_meta(&built.meta_bytes).unwrap().levels.len(), 4);
+    }
+
+    #[test]
+    fn rgba16_mipchain_preserves_native_mip0_samples() {
+        let source = Rgba16Image::from_fn(8, 4, |x, y| {
+            Rgba([
+                (x * 257 + y) as u16,
+                0x1234 + x as u16,
+                0xff00 + y as u16,
+                0x8000 + x as u16 * 3 + y as u16,
+            ])
+        });
+        let spec = MipChainSpec::from_cli(Some(0), Vec::new())
+            .unwrap()
+            .unwrap();
+        let built = build_single_atlas16(&source, 64, &spec).unwrap();
+        let dimensions = built
+            .meta
+            .levels
+            .iter()
+            .map(|level| (level.w, level.h))
+            .collect::<Vec<_>>();
+        assert_eq!(dimensions, vec![(8, 4), (4, 2), (2, 1), (1, 1)]);
+        let mip0 = &built.meta.levels[0];
+        for y in 0..source.height() {
+            for x in 0..source.width() {
+                assert_eq!(
+                    built.image.get_pixel(mip0.x as u32 + x, mip0.y as u32 + y),
+                    source.get_pixel(x, y)
+                );
+            }
+        }
+        assert!(built.resize_stats.taps_total > 0);
     }
 
     #[test]

@@ -1,10 +1,13 @@
+mod animation;
+pub mod api;
 mod atlas;
 mod image_input;
 mod lanczos;
 mod mipchain;
+mod u16_codec;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use image::{ColorType, RgbaImage};
+use image::{ColorType, ImageBuffer, Rgba, RgbaImage};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -84,9 +87,12 @@ impl ColorTransform {
     }
 }
 
+/// Decoder validation mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-enum DecodeSafety {
+pub enum DecodeSafety {
+    /// Validate current format invariants, declared sizes, and trailing bytes.
     Strict,
+    /// Accept legacy containers and relax selected compatibility checks.
     Relaxed,
 }
 
@@ -96,23 +102,36 @@ enum ContainerFormat {
     Legacy,
 }
 
+/// Pixel representation stored in VRAWTEX frame blobs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EncodePixelFormat {
+pub enum EncodePixelFormat {
+    /// Four interleaved 8-bit channels; alpha is preserved losslessly.
     Rgba8,
+    /// Three 8-bit channels; source alpha is discarded.
     Rgb8,
+    /// Four interleaved 16-bit channels stored as planar U16LE streams.
+    Rgba16,
+    /// Three 16-bit channels stored as planar U16LE; source alpha is discarded.
+    Rgb16,
 }
 
+/// Encoder speed/ratio preset.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CompressionProfile {
+pub enum CompressionProfile {
+    /// Zstd level 8, prioritizing encoder throughput.
     Fast,
+    /// Zstd level 10, the default speed/ratio balance.
     #[default]
     Balance,
+    /// Zstd level 16, prioritizing a smaller output.
     Compact,
+    /// Zstd level 22, maximum practical Zstd effort.
     Ultra,
 }
 
 impl CompressionProfile {
-    pub(crate) fn zstd_level(self) -> i32 {
+    /// Zstd level selected by the profile.
+    pub fn zstd_level(self) -> i32 {
         match self {
             CompressionProfile::Fast => 8,
             CompressionProfile::Balance => 10,
@@ -121,7 +140,8 @@ impl CompressionProfile {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    /// Stable CLI spelling.
+    pub fn as_str(self) -> &'static str {
         match self {
             CompressionProfile::Fast => "fast",
             CompressionProfile::Balance => "balance",
@@ -132,20 +152,52 @@ impl CompressionProfile {
 }
 
 impl EncodePixelFormat {
-    fn channels(self) -> u8 {
+    /// Number of logical color channels.
+    pub fn channels(self) -> u8 {
         match self {
-            EncodePixelFormat::Rgba8 => 4,
-            EncodePixelFormat::Rgb8 => 3,
+            EncodePixelFormat::Rgba8 | EncodePixelFormat::Rgba16 => 4,
+            EncodePixelFormat::Rgb8 | EncodePixelFormat::Rgb16 => 3,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// Bytes per channel sample.
+    pub fn sample_bytes(self) -> u64 {
+        match self {
+            EncodePixelFormat::Rgba8 | EncodePixelFormat::Rgb8 => 1,
+            EncodePixelFormat::Rgba16 | EncodePixelFormat::Rgb16 => 2,
+        }
+    }
+
+    /// Numeric `pixfmt` value stored in the container header.
+    pub fn pixfmt_bits(self) -> u16 {
+        match self {
+            EncodePixelFormat::Rgba8 | EncodePixelFormat::Rgb8 => 0x0001,
+            EncodePixelFormat::Rgba16 | EncodePixelFormat::Rgb16 => 0x0002,
+        }
+    }
+
+    /// Returns true for RGB16 and RGBA16.
+    pub fn is_16_bit(self) -> bool {
+        self.sample_bytes() == 2
+    }
+
+    /// Returns true when alpha is retained.
+    pub fn has_alpha(self) -> bool {
+        self.channels() == 4
+    }
+
+    /// Stable human-readable format name.
+    pub fn as_str(self) -> &'static str {
         match self {
             EncodePixelFormat::Rgba8 => "RGBA8",
             EncodePixelFormat::Rgb8 => "RGB8",
+            EncodePixelFormat::Rgba16 => "RGBA16",
+            EncodePixelFormat::Rgb16 => "RGB16",
         }
     }
 }
+
+type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -214,21 +266,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             output,
             recursive,
             rgb8,
+            rgb16,
+            rgba16,
             profile,
             mipchain,
             size,
         } => {
             let mipchain = mipchain::MipChainSpec::from_cli(mipchain, size)?;
+            let pixel_format = encode_pixel_format(rgb8, rgb16, rgba16);
             encode_cmd(
                 input,
                 output,
                 recursive,
                 mipchain,
-                if rgb8 {
-                    EncodePixelFormat::Rgb8
-                } else {
-                    EncodePixelFormat::Rgba8
-                },
+                pixel_format,
                 profile,
                 cli.verbose,
             )
@@ -256,6 +307,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             max_side,
             pad,
             rgb8,
+            rgb16,
+            rgba16,
             profile,
             mipchain,
             size,
@@ -267,9 +320,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             if inputs.is_empty() {
                 return Err("atlas: need at least one INPUT (file or directory)".into());
             }
-            if minecraft && rgb8 {
+            let pixel_format = encode_pixel_format(rgb8, rgb16, rgba16);
+            if minecraft && pixel_format != EncodePixelFormat::Rgba8 {
                 return Err(
-                    "atlas --minecraft cannot use --rgb8 because Minecraft textures require alpha"
+                    "atlas --minecraft requires RGBA8 because Minecraft textures require 8-bit alpha"
                         .into(),
                 );
             }
@@ -294,11 +348,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 max_side,
                 pad,
                 mipchain,
-                if rgb8 {
-                    EncodePixelFormat::Rgb8
-                } else {
-                    EncodePixelFormat::Rgba8
-                },
+                pixel_format,
                 profile,
                 minecraft_options,
                 cli.verbose,
@@ -324,10 +374,22 @@ fn normalize_mipchain_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsSt
     args
 }
 
+fn encode_pixel_format(rgb8: bool, rgb16: bool, rgba16: bool) -> EncodePixelFormat {
+    if rgb16 {
+        EncodePixelFormat::Rgb16
+    } else if rgba16 {
+        EncodePixelFormat::Rgba16
+    } else if rgb8 {
+        EncodePixelFormat::Rgb8
+    } else {
+        EncodePixelFormat::Rgba8
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "vrawtex",
-    about = "vrawtex encoder/decoder/viewer (planar U8 + zstd)"
+    about = "vrawtex image/animation codec (planar U8/U16LE + zstd)"
 )]
 struct Cli {
     /// Verbose stats
@@ -354,10 +416,18 @@ enum Command {
         recursive: bool,
 
         /// Store RGB8 and discard alpha
-        #[arg(long = "rgb8")]
+        #[arg(long = "rgb8", conflicts_with_all = ["rgb16", "rgba16"])]
         rgb8: bool,
 
-        /// Compression profile: fast (zstd 8), balance (10), compact (16)
+        /// Store RGB16LE and discard alpha
+        #[arg(long = "rgb16", conflicts_with = "rgba16")]
+        rgb16: bool,
+
+        /// Store RGBA16LE
+        #[arg(long = "rgba16")]
+        rgba16: bool,
+
+        /// Compression profile: fast (8), balance (10), compact (16), ultra (22)
         #[arg(long = "profile", value_enum, default_value = "balance")]
         profile: CompressionProfile,
 
@@ -434,10 +504,18 @@ enum Command {
         pad: Option<u32>,
 
         /// Store RGB8 and discard alpha
-        #[arg(long = "rgb8")]
+        #[arg(long = "rgb8", conflicts_with_all = ["rgb16", "rgba16"])]
         rgb8: bool,
 
-        /// Compression profile: fast (zstd 8), balance (10), compact (16)
+        /// Store RGB16LE and discard alpha
+        #[arg(long = "rgb16", conflicts_with = "rgba16")]
+        rgb16: bool,
+
+        /// Store RGBA16LE
+        #[arg(long = "rgba16")]
+        rgba16: bool,
+
+        /// Compression profile: fast (8), balance (10), compact (16), ultra (22)
         #[arg(long = "profile", value_enum, default_value = "balance")]
         profile: CompressionProfile,
 
@@ -1188,6 +1266,8 @@ struct ParsedContainer {
     color_transform: ColorTransform,
     width: u32,
     height: u32,
+    pixels: u64,
+    sample_bytes: u8,
     plane_size: u64,
     raw_planar_size: u64,
     packed_alpha_size: u64,
@@ -1268,9 +1348,14 @@ fn parse_container(data: &[u8], safety: DecodeSafety) -> Result<ParsedContainer,
     if chans < 3 || chans > 4 {
         return Err(format!("unsupported channel count in container: {chans}").into());
     }
-    if pixfmt_bits != 0x0001 {
-        return Err(format!("unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}").into());
-    }
+    let sample_bytes = match pixfmt_bits {
+        0x0001 => 1u8,
+        0x0002 if version >= FILE_VERSION => 2u8,
+        0x0002 => return Err("VRAWTEX U16 requires container version 2 or newer".into()),
+        _ => {
+            return Err(format!("unsupported pixel format: pixfmt=0x{pixfmt_bits:04X}").into());
+        }
+    };
 
     let (legacy_delta, alpha_mode, has_meta, color_transform) = parse_feature_byte(version, qval)?;
     let (width, height) = parse_dimmask(dimmask);
@@ -1281,7 +1366,9 @@ fn parse_container(data: &[u8], safety: DecodeSafety) -> Result<ParsedContainer,
     let pixels = (width as u64)
         .checked_mul(height as u64)
         .ok_or("width*height overflow")?;
-    let plane_size = pixels;
+    let plane_size = pixels
+        .checked_mul(sample_bytes as u64)
+        .ok_or("plane byte size overflow")?;
     let raw_planar_size = plane_size
         .checked_mul(chans as u64)
         .ok_or("raw planar overflow")?;
@@ -1355,6 +1442,8 @@ fn parse_container(data: &[u8], safety: DecodeSafety) -> Result<ParsedContainer,
         color_transform,
         width,
         height,
+        pixels,
+        sample_bytes,
         plane_size,
         raw_planar_size,
         packed_alpha_size,
@@ -1934,6 +2023,171 @@ fn encode_one(
     let start_total = Instant::now();
     let original_size = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
 
+    if image_input::is_streamed_animation_ext(input) {
+        if mipchain.is_some() {
+            return Err("animated inputs cannot be combined with --mipchain".into());
+        }
+        if verbose {
+            println!(
+                "[vrawtex] Opening streamed animation {} ({})",
+                input.display(),
+                pixel_format.as_str()
+            );
+        }
+        if let Some(bytes) =
+            animation::encode_streamed_animation(input, pixel_format, profile, verbose)?
+        {
+            let header = animation::parse_header(&bytes)?;
+            fs::write(out_path, bytes)?;
+            println!(
+                "Encoded {}x{} {} animation ({} frames) -> {}",
+                header.width,
+                header.height,
+                pixel_format.as_str(),
+                header.frames.len(),
+                out_path.display()
+            );
+            return Ok(());
+        }
+    }
+
+    if pixel_format.is_16_bit()
+        && let Some(animation) = image_input::load_animation16(input)?
+    {
+        if mipchain.is_some() {
+            return Err("animated inputs cannot be combined with --mipchain".into());
+        }
+        let first = animation
+            .frames
+            .first()
+            .ok_or("animation contains no frames")?;
+        let (width, height) = first.image.dimensions();
+        if verbose {
+            println!(
+                "[vrawtex] Encoding animation {} ({}x{}, {} frames, {})",
+                input.display(),
+                width,
+                height,
+                animation.frames.len(),
+                pixel_format.as_str()
+            );
+        }
+        let bytes = animation::encode_animation16(&animation, pixel_format, profile, verbose)?;
+        fs::write(out_path, bytes)?;
+        println!(
+            "Encoded {}x{} {} animation ({} frames) -> {}",
+            width,
+            height,
+            pixel_format.as_str(),
+            animation.frames.len(),
+            out_path.display()
+        );
+        return Ok(());
+    }
+
+    if !pixel_format.is_16_bit()
+        && let Some(animation) = image_input::load_animation(input)?
+    {
+        if mipchain.is_some() {
+            return Err("animated inputs cannot be combined with --mipchain".into());
+        }
+        let first = animation
+            .frames
+            .first()
+            .ok_or("animation contains no frames")?;
+        let (width, height) = first.image.dimensions();
+        if verbose {
+            println!(
+                "[vrawtex] Encoding animation {} ({}x{}, {} frames, {})",
+                input.display(),
+                width,
+                height,
+                animation.frames.len(),
+                pixel_format.as_str()
+            );
+        }
+        let bytes = animation::encode_animation(&animation, pixel_format, profile, verbose)?;
+        fs::write(out_path, bytes)?;
+        println!(
+            "Encoded {}x{} {} animation ({} frames) -> {}",
+            width,
+            height,
+            pixel_format.as_str(),
+            animation.frames.len(),
+            out_path.display()
+        );
+        return Ok(());
+    }
+
+    if pixel_format.is_16_bit() {
+        let rgba = image_input::load_rgba16(input)?;
+        let (width, height) = rgba.dimensions();
+        if verbose {
+            println!(
+                "[vrawtex] Encoding {} ({}x{}, {}, mipchain={})",
+                input.display(),
+                width,
+                height,
+                pixel_format.as_str(),
+                mipchain.is_some()
+            );
+        }
+        let bytes = if let Some(spec) = mipchain {
+            let start_mips = Instant::now();
+            let built = mipchain::build_single_atlas16(&rgba, MAX_STRICT_SIDE, spec)?;
+            if verbose {
+                println!(
+                    "[vrawtex] Mipchain: levels={}, atlas={}x{}, lanczos_radius={}%, taps={}, ops={}, build={}",
+                    built.meta.levels.len(),
+                    built.image.width(),
+                    built.image.height(),
+                    crate::lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
+                    built.resize_stats.taps_total,
+                    built.resize_stats.ops_total,
+                    format_duration_ns(start_mips.elapsed())
+                );
+            }
+            u16_codec::encode_rgba16_with_meta_to_vec(
+                &built.image,
+                Some(&built.meta_bytes),
+                pixel_format,
+                profile,
+                verbose,
+                Some(original_size),
+                start_total,
+            )?
+        } else {
+            u16_codec::encode_rgba16_with_meta_to_vec(
+                &rgba,
+                None,
+                pixel_format,
+                profile,
+                verbose,
+                Some(original_size),
+                start_total,
+            )?
+        };
+        fs::write(out_path, &bytes)?;
+        if mipchain.is_some() {
+            println!(
+                "Encoded {}x{} {} mipchain -> {}",
+                width,
+                height,
+                pixel_format.as_str(),
+                out_path.display()
+            );
+        } else {
+            println!(
+                "Encoded {}x{} {} -> {}",
+                width,
+                height,
+                pixel_format.as_str(),
+                out_path.display()
+            );
+        }
+        return Ok(());
+    }
+
     let rgba = image_input::load_rgba8(input)?;
     let (width, height) = rgba.dimensions();
 
@@ -1953,10 +2207,11 @@ fn encode_one(
         let built = mipchain::build_single_atlas(&rgba, MAX_STRICT_SIDE, spec)?;
         if verbose {
             println!(
-                "[vrawtex] Mipchain: levels={}, atlas={}x{}, lanczos_radius=100%, taps={}, ops={}, build={}",
+                "[vrawtex] Mipchain: levels={}, atlas={}x{}, lanczos_radius={}%, taps={}, ops={}, build={}",
                 built.meta.levels.len(),
                 built.image.width(),
                 built.image.height(),
+                crate::lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
                 built.resize_stats.taps_total,
                 built.resize_stats.ops_total,
                 format_duration_ns(start_mips.elapsed())
@@ -2058,6 +2313,9 @@ pub(crate) fn encode_rgba8_with_meta_to_vec(
     original_size_opt: Option<u64>,
     start_total: Instant,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    if pixel_format.is_16_bit() {
+        return Err("RGBA8 encoder cannot write a 16-bit pixel format".into());
+    }
     let (width, height) = rgba.dimensions();
     let rgba_bytes = rgba.as_raw();
     let zstd_level = profile.zstd_level();
@@ -2764,10 +3022,32 @@ fn decode_cmd(
     let data = fs::read(&input)?;
     let file_size = data.len() as u64;
 
+    if animation::is_animation(&data) {
+        return animation::decode_to_files(&data, &input, output, to, safety, dump_meta, verbose);
+    }
+
     let parsed = parse_container(&data, safety)?;
     let atlas_meta = parse_atlas_meta(parsed.meta_raw.as_deref());
     let minecraft_atlas_meta = parse_minecraft_atlas_meta(parsed.meta_raw.as_deref());
     let mipchain_meta = parse_mipchain_meta(parsed.meta_raw.as_deref());
+
+    if parsed.sample_bytes == 2 {
+        return decode_u16_cmd(
+            &input,
+            output,
+            to,
+            safety,
+            dump_meta,
+            verbose,
+            start_total,
+            file_size,
+            parsed,
+            atlas_meta,
+            minecraft_atlas_meta,
+            mipchain_meta,
+            &data,
+        );
+    }
 
     if verbose {
         println!(
@@ -2946,6 +3226,143 @@ fn decode_cmd(
         );
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_u16_cmd(
+    input: &Path,
+    output: Option<PathBuf>,
+    to: DecodeFormat,
+    safety: DecodeSafety,
+    dump_meta: Option<PathBuf>,
+    verbose: bool,
+    start_total: Instant,
+    file_size: u64,
+    parsed: ParsedContainer,
+    atlas_meta: Option<atlas::AtlasMeta>,
+    minecraft_atlas_meta: Option<atlas::MinecraftAtlasMeta>,
+    mipchain_meta: Option<mipchain::MipChainMeta>,
+    data: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    if verbose {
+        println!(
+            "[vrawtex] Decoding {} ({}x{}, {} channels, U16LE, format={:?}, version={})",
+            input.display(),
+            parsed.width,
+            parsed.height,
+            parsed.chans,
+            parsed.format,
+            parsed.version
+        );
+    }
+    let start_decode = Instant::now();
+    let (planes, predictors, comp_sizes, _) =
+        u16_codec::decode_container_to_planes_u16(&parsed, data, safety, true)?;
+    let decode_elapsed = start_decode.elapsed();
+    let base = output.unwrap_or_else(|| default_decode_base_path(input));
+    let pixels = parsed.pixels as usize;
+
+    let out_path = match to {
+        DecodeFormat::Raw => {
+            let mut raw = Vec::with_capacity(parsed.raw_planar_size as usize);
+            for plane in planes.iter().take(parsed.chans as usize) {
+                for sample in plane {
+                    raw.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
+            let path = with_ext(&base, "raw");
+            fs::write(&path, raw)?;
+            path
+        }
+        DecodeFormat::Png => {
+            let path = with_ext(&base, "png");
+            if parsed.chans == 4 {
+                let mut interleaved = vec![0u16; pixels * 4];
+                for index in 0..pixels {
+                    for channel in 0..4 {
+                        interleaved[index * 4 + channel] = planes[channel][index];
+                    }
+                }
+                let image = ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(
+                    parsed.width,
+                    parsed.height,
+                    interleaved,
+                )
+                .ok_or("failed to build RGBA16 output image")?;
+                image::DynamicImage::ImageRgba16(image).save(&path)?;
+            } else {
+                let mut interleaved = vec![0u16; pixels * 3];
+                for index in 0..pixels {
+                    for channel in 0..3 {
+                        interleaved[index * 3 + channel] = planes[channel][index];
+                    }
+                }
+                let image = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
+                    parsed.width,
+                    parsed.height,
+                    interleaved,
+                )
+                .ok_or("failed to build RGB16 output image")?;
+                image::DynamicImage::ImageRgb16(image).save(&path)?;
+            }
+            path
+        }
+    };
+
+    println!(
+        "Decoded {}x{} ({} channels, U16LE) -> {}",
+        parsed.width,
+        parsed.height,
+        parsed.chans,
+        out_path.display()
+    );
+    if verbose {
+        print_decode_stats(
+            file_size,
+            parsed.raw_planar_size,
+            &comp_sizes,
+            parsed.chans,
+            decode_elapsed,
+            start_total.elapsed(),
+            match to {
+                DecodeFormat::Raw => "RAW16LE",
+                DecodeFormat::Png => "PNG16",
+            },
+            &out_path,
+        );
+        println!(
+            "[vrawtex] Predictors: R={}, G={}, B={}, A={}",
+            predictors[0].as_str(),
+            predictors[1].as_str(),
+            predictors[2].as_str(),
+            if parsed.chans == 4 {
+                predictors[3].as_str()
+            } else {
+                "n/a"
+            }
+        );
+    }
+
+    if let Some(meta) = minecraft_atlas_meta.as_ref() {
+        let path = dump_meta.unwrap_or_else(|| with_ext(&base, "minecraft-atlas.json"));
+        dump_minecraft_atlas_meta(&path, meta)?;
+        println!("[vrawtex] Minecraft atlas meta JSON -> {}", path.display());
+    } else if let Some(meta) = atlas_meta.as_ref() {
+        let path = dump_meta.unwrap_or_else(|| with_ext(&base, "atlas.json"));
+        dump_atlas_meta(&path, meta)?;
+        println!("[vrawtex] Atlas meta JSON -> {}", path.display());
+    } else if let Some(meta) = mipchain_meta.as_ref() {
+        let path = dump_meta.unwrap_or_else(|| with_ext(&base, "mipchain.json"));
+        dump_mipchain_meta(&path, meta)?;
+        println!("[vrawtex] Mipchain meta JSON -> {}", path.display());
+    } else if let Some(path) = dump_meta {
+        return Err(format!(
+            "requested --dump-meta {}, but recognized metadata was not found",
+            path.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -3162,6 +3579,10 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
     let data = fs::read(&input)?;
     let file_size = data.len() as u64;
 
+    if animation::is_animation(&data) {
+        return animation::open_animation(&data, &input, safety, verbose);
+    }
+
     let parsed = parse_container(&data, safety)?;
     let atlas_meta = parse_atlas_meta(parsed.meta_raw.as_deref());
     let minecraft_atlas_meta = parse_minecraft_atlas_meta(parsed.meta_raw.as_deref());
@@ -3169,19 +3590,38 @@ fn open_cmd(input: PathBuf, safety: DecodeSafety, verbose: bool) -> Result<(), B
 
     if verbose {
         println!(
-            "[vrawtex] Opening {} ({}x{}, {} channels, U8, format={:?}, version={})",
+            "[vrawtex] Opening {} ({}x{}, {} channels, {}, format={:?}, version={})",
             input.display(),
             parsed.width,
             parsed.height,
             parsed.chans,
+            if parsed.sample_bytes == 2 {
+                "U16LE"
+            } else {
+                "U8"
+            },
             parsed.format,
             parsed.version
         );
     }
 
     let start_dec = Instant::now();
-    let (planes, plane_predictors, comp_sizes, _end_offset) =
-        decode_container_to_planes(&parsed, &data, safety, false)?;
+    let (planes, plane_predictors, comp_sizes, _end_offset) = if parsed.sample_bytes == 2 {
+        let (planes, predictors, sizes, offset) =
+            u16_codec::decode_container_to_planes_u16(&parsed, &data, safety, false)?;
+        let preview = planes
+            .into_iter()
+            .map(|plane| {
+                plane
+                    .into_iter()
+                    .map(|sample| (sample >> 8) as u8)
+                    .collect()
+            })
+            .collect();
+        (preview, predictors, sizes, offset)
+    } else {
+        decode_container_to_planes(&parsed, &data, safety, false)?
+    };
     let elapsed_dec = start_dec.elapsed();
     let elapsed_total = start_total.elapsed();
 
@@ -3458,6 +3898,46 @@ fn inspect_cmd(
         if let Some(path) = dump_meta {
             dump_texture_pack_header(&path, &header)?;
             println!("[vrawtex] VTP header JSON -> {}", path.display());
+        }
+        return Ok(());
+    }
+
+    if animation::is_animation(&data) {
+        let header = animation::parse_header(&data)?;
+        println!("File: {}", input.display());
+        println!(
+            "Format: VRAWTEX animation (version={}) | Image: {}x{} | Frames: {} | pixfmt=0x{:04X} | channels={}",
+            header.version,
+            header.width,
+            header.height,
+            header.frames.len(),
+            header.pixfmt,
+            header.channels
+        );
+        println!(
+            "Layout: blob_section_offset={} loop_count={}",
+            header.blob_section_offset, header.loop_count
+        );
+        for frame in &header.frames {
+            println!(
+                "  Frame #{}: delay={}/{} ms reference={} coding={:?} rect={:?} motion={:?} offset={} len={}",
+                frame.index,
+                frame.duration_num_ms,
+                frame.duration_den_ms,
+                frame
+                    .reference
+                    .map(|reference| reference.to_string())
+                    .unwrap_or_else(|| "keyframe".to_owned()),
+                frame.coding,
+                frame.rect,
+                frame.motion,
+                frame.offset,
+                frame.len
+            );
+        }
+        if let Some(path) = dump_meta {
+            fs::write(&path, serde_json::to_vec_pretty(&header)?)?;
+            println!("[vrawtex] Animation header JSON -> {}", path.display());
         }
         return Ok(());
     }

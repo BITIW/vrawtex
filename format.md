@@ -4,11 +4,13 @@ This document describes the binary formats produced by the current `vrawtex`
 encoder:
 
 - VRAWTEX container version 2 (`.vrawtex`);
+- VRAWTEX animation container version 2 (`VRAWANM`), with v1 read compatibility;
 - VRAWTEX Texture Pack container version 1 (`.vtp`);
 - MessagePack metadata used by atlases, mipchains, and Minecraft texture packs.
 
-The format is lossless for the selected pixel format. `RGBA8` preserves all four
-8-bit channels. `RGB8` intentionally discards input alpha before encoding.
+The format is lossless for the selected pixel format. `RGBA8` and `RGBA16`
+preserve all four channels. `RGB8` and `RGB16` intentionally discard input
+alpha before encoding.
 
 ## Conventions
 
@@ -16,8 +18,8 @@ The format is lossless for the selected pixel format. `RGBA8` preserves all four
   little-endian.
 - Pixel coordinates use a top-left origin.
 - Pixel and plane order is row-major, left-to-right and top-to-bottom.
-- Arithmetic in color transforms and predictors is modulo 256 (`wrapping_add`
-  and `wrapping_sub` on `u8`).
+- Arithmetic in color transforms, predictors, and animation deltas is modulo
+  256 for U8 or modulo 65,536 for U16.
 - MessagePack integers use normal MessagePack representation, not the
   fixed-width little-endian convention.
 - `ceil_div(a, b)` means `(a + b - 1) / b` for non-negative integers.
@@ -81,8 +83,9 @@ Current values:
 | Field | Value | Meaning |
 |---|---:|---|
 | `pixfmt` | `0x0001` | Unsigned 8-bit samples |
-| `channels` | `3` | RGB8 |
-| `channels` | `4` | RGBA8 |
+| `pixfmt` | `0x0002` | Unsigned 16-bit little-endian samples |
+| `channels` | `3` | RGB8 or RGB16, according to `pixfmt` |
+| `channels` | `4` | RGBA8 or RGBA16, according to `pixfmt` |
 
 The `qval` feature byte is laid out as follows:
 
@@ -112,8 +115,8 @@ If `has_meta == 0`, neither `meta_len` nor metadata bytes are present.
 
 | ID | Name | Stored alpha payload |
 |---:|---|---|
-| 0 | `Normal` | One full `width * height` byte plane |
-| 1 | `Opaque255` | No alpha stream; reconstruct every alpha sample as 255 |
+| 0 | `Normal` | One full `width * height` sample plane |
+| 1 | `Opaque255` | No alpha stream; reconstruct alpha as 255 for U8 or 65,535 for U16 (the legacy name is retained) |
 | 2 | `Transparent0` | No alpha stream; reconstruct every alpha sample as 0 |
 | 3 | `Mask1Bit` | One packed bit per pixel, then Zstd-compressed |
 
@@ -127,7 +130,7 @@ LSB-first:
 byte_index = pixel_index >> 3
 bit_index  = pixel_index & 7
 bit 0 means alpha 0
-bit 1 means alpha 255
+bit 1 means alpha 255 for U8 or 65,535 for U16
 packed_size = ceil_div(width * height, 8)
 ```
 
@@ -148,17 +151,18 @@ complete Zstd frame:
 
 Expected `orig_size` values:
 
-- RGB stream: `width * height`;
-- normal alpha stream: `width * height`;
+- RGB stream: `width * height * sample_bytes`;
+- normal alpha stream: `width * height * sample_bytes`;
 - 1-bit alpha stream: `ceil_div(width * height, 8)`.
 
 Each stream is compressed independently. Zstd level, worker count, and chunk
 size are encoder tuning parameters and are not part of the file format. A
 decoder only needs a conforming Zstd frame decoder.
 
-The reference CLI exposes `fast`, `balance`, and `compact` compression profiles,
-currently mapped to Zstd levels 8, 10, and 16. `balance` is the default. These
-profiles do not alter container flags, stream order, or decoder compatibility.
+The reference CLI exposes `fast`, `balance`, `compact`, and `ultra` compression
+profiles, currently mapped to Zstd levels 8, 10, 16, and 22. `balance` is the
+default. These profiles do not alter container flags, stream order, or decoder
+compatibility.
 
 ### Color transforms
 
@@ -171,8 +175,8 @@ Color transforms run before per-plane predictors. They only affect RGB.
 | 2 | `SubRed` | `R'=R, G'=G-R, B'=B-R` |
 | 3 | `SubBlue` | `R'=R-B, G'=G-B, B'=B` |
 
-All subtraction wraps modulo 256. Inverse transforms add the unchanged
-reference channel back:
+All subtraction wraps at the selected sample width. Inverse transforms add the
+unchanged reference channel back with the same wrapping arithmetic:
 
 ```text
 SubGreen: R = R' + G', G = G',      B = B' + G'
@@ -207,16 +211,17 @@ else choose up if pb <= pc
 else choose up_left
 ```
 
-Decoding adds the same prediction to each residual modulo 256. Rows must be
-decoded top-to-bottom for `Up` and `Paeth`. Different planes may be decoded in
-parallel.
+Decoding adds the same prediction to each residual modulo 256 or 65,536. U16
+residual planes are serialized sample-by-sample as little-endian `u16`. Rows
+must be decoded top-to-bottom for `Up` and `Paeth`. Different planes may be
+decoded in parallel.
 
 ### Encoder pipeline
 
 The current encoder performs these logical steps:
 
-1. Decode the source image and convert it to interleaved RGBA8.
-2. Select output pixel format (`RGBA8` or `RGB8`).
+1. Decode the source image and convert it to interleaved RGBA8 or RGBA16.
+2. Select output pixel format (`RGBA8`, `RGB8`, `RGBA16`, or `RGB16`).
 3. Detect constant or binary alpha representation.
 4. Sample the image and choose one RGB color transform plus one predictor per
    stored channel.
@@ -244,6 +249,7 @@ for each stored stream in R, G, B, [A] order:
     read orig_size, comp_size, predictor
     bounds-check comp_size
     Zstd-decompress exactly orig_size bytes
+    parse little-endian u16 samples when pixfmt is 0x0002
 
 reconstruct implicit alpha or unpack Mask1Bit alpha
 inverse-predict normal byte planes
@@ -263,6 +269,128 @@ The current strict limits are:
 | Maximum pixel count | 484,000,000 pixels |
 | Maximum decoded planar data | 2,000,000,000 bytes |
 | Maximum metadata block | 16 MiB |
+
+## VRAWTEX animation v2
+
+The animation container groups complete VRAWTEX v2 frame blobs and timing
+metadata. It uses the same `.vrawtex` extension; readers distinguish it by its
+eight-byte magic.
+
+### Binary layout
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | Magic `VRAWANM\0` |
+| 8 | 2 | Container version, u16 LE, currently `2` |
+| 10 | 8 | `header_len`, u64 LE |
+| 18 | `header_len` | Positional MessagePack `AnimationHeader` |
+| `18 + header_len` | remaining | Complete VRAWTEX frame blobs |
+
+There is no alignment between frame blobs. All frame offsets are absolute from
+the start of the animation file.
+
+### Animation MessagePack header
+
+Version 2 serializes structs as positional MessagePack arrays to avoid repeating
+field names for every frame. The top-level field order is:
+
+```text
+[kind, version, width, height, pixfmt, channels, loop_count,
+ blob_section_offset, frames]
+```
+
+Each frame entry uses:
+
+```text
+[index, duration_num_ms, duration_den_ms, reference, coding,
+ rect, motion, offset, len]
+```
+
+`rect` is either nil or `[x, y, width, height]`. `motion` is either nil or
+`[dx, dy]`. The equivalent JSON representation is:
+
+The header is equivalent to:
+
+```json
+{
+  "kind": "vrawtex.animation",
+  "version": 2,
+  "width": 1920,
+  "height": 1080,
+  "pixfmt": 1,
+  "channels": 4,
+  "loop_count": 0,
+  "blob_section_offset": 512,
+  "frames": [
+    {
+      "index": 0,
+      "duration_num_ms": 40,
+      "duration_den_ms": 1,
+      "reference": null,
+      "coding": "full",
+      "rect": null,
+      "motion": null,
+      "offset": 512,
+      "len": 100000
+    },
+    {
+      "index": 1,
+      "duration_num_ms": 1000,
+      "duration_den_ms": 24,
+      "reference": 0,
+      "coding": "motion",
+      "rect": null,
+      "motion": [2, 0],
+      "offset": 100512,
+      "len": 12000
+    }
+  ]
+}
+```
+
+`duration_num_ms / duration_den_ms` is the frame duration in milliseconds.
+The denominator must be non-zero. `loop_count == 0` means infinite looping.
+`pixfmt` and channel count must match every non-empty embedded frame blob.
+
+Frame zero is a full keyframe and has `reference == null`. Later frames may also
+become keyframes when a delta would be larger. A wrapping delta uses:
+
+```text
+stored_sample = current_sample - reference_sample
+current_sample = stored_sample + reference_sample
+```
+
+`coding` selects how the blob is interpreted:
+
+| Coding | Blob | Reconstruction |
+|---|---|---|
+| `full` without reference | Full-size VRAWTEX | Keyframe pixels |
+| `full` with reference | Full-size VRAWTEX | Same-coordinate wrapping delta |
+| `copy` | Empty (`len == 0`) | Exact reference-frame copy |
+| `rect` | VRAWTEX sized to `rect.width x rect.height` | Delta applied only inside `rect` |
+| `motion` | Full-size VRAWTEX | Delta from reference pixel `(x + dx, y + dy)`; out-of-bounds prediction is zero |
+
+The encoder sample-scores full keyframe, frame-zero delta, previous-frame
+delta, a changed rectangle when it covers at most 60% of the image, and a
+bounded global motion candidate. Motion search is limited to +/-8 pixels and
+must improve sampled absolute error by at least 10%. Only the selected
+candidate receives full profile-level Zstd compression.
+
+Every non-empty payload remains a complete independently Zstd-compressed
+VRAWTEX blob. This preserves frame-level indexing and avoids a shared stream or
+dictionary dependency. Experiments rejected sparse tile payloads, trained Zstd
+dictionaries, XOR residuals, and wide reference windows because their measured
+size gain did not justify their encode-time or decoding complexity.
+
+Offsets and lengths must stay within the file, references must point backward,
+and frame indices must be contiguous from zero. Frame blobs may be decompressed
+in dependency order. The streaming viewer bounds its reconstructed-frame LRU;
+if an older dependency was evicted, it reconstructs that backward chain on
+demand instead of retaining the complete animation.
+
+Version 1 used named MessagePack maps and supported only `full` coding. Missing
+v2 frame fields deserialize as `coding=full`, `rect=nil`, and `motion=nil`, so
+the current decoder reads both versions.
 
 ## VRAWTEX metadata schemas
 
@@ -391,10 +519,11 @@ The header is equivalent to:
 }
 ```
 
-`icon` may be `null`. Its payload is stored unchanged; `format` currently comes
-from the source extension (`png`, `raw`, or `vrawtex`, otherwise `raw`). Each
-atlas payload is a complete VRAWTEX v2 file and contains its own Minecraft atlas
-metadata for resource-to-rectangle lookup.
+`icon` may be `null`. PNG and VRAWTEX payloads are stored unchanged. Other
+supported image inputs are decoded to RGBA8 and embedded as a VRAWTEX icon, so
+new writers emit `png` or `vrawtex`. Older VTP files may still contain `raw`.
+Each atlas payload is a complete VRAWTEX v2 file and contains its own Minecraft
+atlas metadata for resource-to-rectangle lookup.
 
 Producers write blobs in this order:
 
@@ -441,6 +570,7 @@ be recovered.
 ## Versioning and forward compatibility
 
 - Current VRAWTEX container version: `2`.
+- Current VRAWTEX animation container/header version: `2` (v1 readable).
 - Current VTP container/header version: `1`.
 - Current mipchain metadata version: `1`.
 - Current Minecraft atlas metadata version: `2`.

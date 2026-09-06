@@ -3,10 +3,22 @@ name = "vrawtex"
 version = "0.1.1"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "vrawtex"
+path = "src/main.rs"
+test = false
+bench = false
+
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 image = "0.25.9"
+jxl-oxide = "0.12.6"
 minifb = "0.28.0"
+lanczos-ultra = { path = "lanczos-ultra" }
 rawloader = "0.37.1"
 rawler = "0.7.2"
 rayon = "1.11.0"

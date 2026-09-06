@@ -1,6 +1,6 @@
 use crate::image_input;
 use crate::lanczos;
-use image::RgbaImage;
+use image::{ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,9 @@ struct TexItem {
     w: u32,
     h: u32,
     rgba: RgbaImage,
+    rgba16: Option<crate::Rgba16Image>,
+    rgba16_source: Option<crate::Rgba16Image>,
+    rgba_source: Option<RgbaImage>,
     sig: lanczos::EdgeSig,
     area: u64,
     minecraft: Option<MinecraftResource>,
@@ -75,6 +78,11 @@ struct TexturePackAtlasData {
     height: u32,
     entries: usize,
     bytes: Vec<u8>,
+}
+
+enum AtlasPixels {
+    U8(RgbaImage),
+    U16(crate::Rgba16Image),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -282,16 +290,36 @@ fn load_icon_blob(
     if !path.is_file() {
         return Err(format!("atlas --minecraft --ico: {} is not a file", path.display()).into());
     }
-    let bytes = fs::read(&path).map_err(|e| {
+    let format = blob_format(&path);
+    if format == "raw" {
+        let image = crate::image_input::load_rgba8(&path).map_err(|error| {
+            format!(
+                "atlas --minecraft --ico: cannot decode {}: {error}",
+                path.display()
+            )
+        })?;
+        let bytes = crate::encode_rgba8_with_meta_to_vec(
+            &image,
+            None,
+            crate::EncodePixelFormat::Rgba8,
+            crate::CompressionProfile::Balance,
+            false,
+            None,
+            std::time::Instant::now(),
+        )?;
+        return Ok(Some(TexturePackBlobData {
+            format: "vrawtex".to_owned(),
+            bytes,
+        }));
+    }
+
+    let bytes = fs::read(&path).map_err(|error| {
         format!(
-            "atlas --minecraft --ico: cannot read {}: {e}",
+            "atlas --minecraft --ico: cannot read {}: {error}",
             path.display()
         )
     })?;
-    Ok(Some(TexturePackBlobData {
-        format: blob_format(&path),
-        bytes,
-    }))
+    Ok(Some(TexturePackBlobData { format, bytes }))
 }
 
 fn collect_inputs(
@@ -705,6 +733,72 @@ fn blit_atlas(side: u32, pad: u32, placements: &[Placed], items: &[TexItem]) -> 
     }
 
     atlas
+}
+
+fn blit_atlas16(
+    side: u32,
+    pad: u32,
+    placements: &[Placed],
+    items: &[TexItem],
+) -> crate::Rgba16Image {
+    let mut atlas = ImageBuffer::from_pixel(side, side, Rgba([0u16, 0, 0, 0]));
+    let by_id: HashMap<u32, &TexItem> = items.iter().map(|item| (item.id, item)).collect();
+    for placement in placements {
+        let item = *by_id.get(&placement.id).expect("id");
+        let source = item.rgba16.as_ref().expect("16-bit atlas item");
+        for y in 0..item.h {
+            for x in 0..item.w {
+                atlas.put_pixel(placement.x + x, placement.y + y, *source.get_pixel(x, y));
+            }
+        }
+        fill_padding16(&mut atlas, side, pad, placement);
+    }
+    atlas
+}
+
+fn fill_padding16(atlas: &mut crate::Rgba16Image, side: u32, pad: u32, p: &Placed) {
+    if pad == 0 {
+        return;
+    }
+    let side = side as i32;
+    let x0 = p.x as i32;
+    let y0 = p.y as i32;
+    let w = p.w as i32;
+    let h = p.h as i32;
+    let pad = pad as i32;
+    let clamp = |value: i32| value.clamp(0, side - 1) as u32;
+
+    for dy in 1..=pad {
+        for x in 0..w {
+            let x = clamp(x0 + x);
+            let top = *atlas.get_pixel(x, clamp(y0));
+            let bottom = *atlas.get_pixel(x, clamp(y0 + h - 1));
+            atlas.put_pixel(x, clamp(y0 - dy), top);
+            atlas.put_pixel(x, clamp(y0 + h - 1 + dy), bottom);
+        }
+    }
+    for dx in 1..=pad {
+        for y in 0..h {
+            let y = clamp(y0 + y);
+            let left = *atlas.get_pixel(clamp(x0), y);
+            let right = *atlas.get_pixel(clamp(x0 + w - 1), y);
+            atlas.put_pixel(clamp(x0 - dx), y, left);
+            atlas.put_pixel(clamp(x0 + w - 1 + dx), y, right);
+        }
+    }
+    for dy in 1..=pad {
+        for dx in 1..=pad {
+            for (source_x, source_y, target_x, target_y) in [
+                (x0, y0, x0 - dx, y0 - dy),
+                (x0 + w - 1, y0, x0 + w - 1 + dx, y0 - dy),
+                (x0, y0 + h - 1, x0 - dx, y0 + h - 1 + dy),
+                (x0 + w - 1, y0 + h - 1, x0 + w - 1 + dx, y0 + h - 1 + dy),
+            ] {
+                let pixel = *atlas.get_pixel(clamp(source_x), clamp(source_y));
+                atlas.put_pixel(clamp(target_x), clamp(target_y), pixel);
+            }
+        }
+    }
 }
 
 fn fill_padding(atlas: &mut RgbaImage, side: u32, pad: u32, p: &Placed) {
@@ -1217,8 +1311,25 @@ pub fn atlas_cmd(
     let load_results: Vec<Result<TexItem, String>> = paths
         .par_iter()
         .map(|p| {
-            let img = image_input::load_rgba8(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let (img, img16) = if pixel_format.is_16_bit() {
+                let image16 =
+                    image_input::load_rgba16(p).map_err(|e| format!("{}: {e}", p.display()))?;
+                let preview = ImageBuffer::from_fn(image16.width(), image16.height(), |x, y| {
+                    Rgba(image16.get_pixel(x, y).0.map(|sample| (sample >> 8) as u8))
+                });
+                (preview, Some(image16))
+            } else {
+                (
+                    image_input::load_rgba8(p).map_err(|e| format!("{}: {e}", p.display()))?,
+                    None,
+                )
+            };
             let (w, h) = img.dimensions();
+            let rgba_source = if pixel_format.is_16_bit() {
+                None
+            } else {
+                Some(img.clone())
+            };
             let sig = lanczos::edge_signature(&img, EDGE_K, EDGE_THICKNESS, EDGE_RADIUS_PX);
             let minecraft = minecraft_pack
                 .as_ref()
@@ -1230,6 +1341,9 @@ pub fn atlas_cmd(
                 w,
                 h,
                 rgba: img,
+                rgba16: img16.clone(),
+                rgba16_source: img16.clone(),
+                rgba_source,
                 sig,
                 area: w as u64 * h as u64,
                 minecraft,
@@ -1362,23 +1476,36 @@ pub fn atlas_cmd(
             }
 
             let t_blit = Instant::now();
-            let atlas_img = blit_atlas(side0, pad, &pl, &chunk_items);
+            let atlas_img = if pixel_format.is_16_bit() {
+                AtlasPixels::U16(blit_atlas16(side0, pad, &pl, &chunk_items))
+            } else {
+                AtlasPixels::U8(blit_atlas(side0, pad, &pl, &chunk_items))
+            };
             let blit_dt = t_blit.elapsed();
 
             let t_meta = Instant::now();
             let meta = make_meta(pad, &pl, &chunk_items, minecraft_pack.as_ref())?;
             let meta_dt = t_meta.elapsed();
-
-            // test encode size (важно: это твой же encoder, только в Vec)
-            let test = crate::encode_rgba8_with_meta_to_vec(
-                &atlas_img,
-                Some(&meta),
-                pixel_format,
-                profile,
-                false, // verbose для теста
-                None,
-                std::time::Instant::now(),
-            )?;
+            let test = match atlas_img {
+                AtlasPixels::U8(image) => crate::encode_rgba8_with_meta_to_vec(
+                    &image,
+                    Some(&meta),
+                    pixel_format,
+                    profile,
+                    false,
+                    None,
+                    std::time::Instant::now(),
+                )?,
+                AtlasPixels::U16(image) => crate::u16_codec::encode_rgba16_with_meta_to_vec(
+                    &image,
+                    Some(&meta),
+                    pixel_format,
+                    profile,
+                    false,
+                    None,
+                    std::time::Instant::now(),
+                )?,
+            };
             let test_size = test.len() as u64;
 
             if verbose {
@@ -1463,7 +1590,6 @@ pub fn atlas_cmd(
                         .is_none_or(|limit| level_idx <= limit))
             {
                 let t_mip = Instant::now();
-                let target_side = explicit_sides.as_ref().map(|sides| sides[level_idx - 1]);
                 let (taps, ops) = mip_items
                     .par_iter_mut()
                     .map(|item| {
@@ -1471,17 +1597,41 @@ pub fn atlas_cmd(
                             return (0u64, 0u64);
                         }
 
-                        let (dst_w, dst_h) = if let Some(target_side) = target_side {
-                            (
-                                scale_dimension(item.w, previous_side, target_side),
-                                scale_dimension(item.h, previous_side, target_side),
-                            )
+                        let target_side = explicit_sides
+                            .as_ref()
+                            .map(|sides| sides[level_idx - 1])
+                            .unwrap_or_else(|| (previous_side / 2).max(1));
+                        let (dst_w, dst_h) = (
+                            scale_dimension(item.w, previous_side, target_side),
+                            scale_dimension(item.h, previous_side, target_side),
+                        );
+                        let stats = if pixel_format.is_16_bit() {
+                            let source = item
+                                .rgba16_source
+                                .as_ref()
+                                .expect("16-bit atlas item has base pixels");
+                            let (resized, stats) = lanczos::resize_lanczos_rgba16_percent(
+                                source,
+                                dst_w,
+                                dst_h,
+                                lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
+                            );
+                            item.rgba16 = Some(resized);
+                            stats
                         } else {
-                            ((item.w / 2).max(1), (item.h / 2).max(1))
+                            let source = item
+                                .rgba_source
+                                .as_ref()
+                                .expect("RGBA atlas item has base pixels");
+                            let (resized, stats) = lanczos::resize_lanczos_rgba_percent(
+                                source,
+                                dst_w,
+                                dst_h,
+                                lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
+                            );
+                            item.rgba = resized;
+                            stats
                         };
-                        let (resized, stats) =
-                            lanczos::resize_lanczos_rgba_percent(&item.rgba, dst_w, dst_h, 100);
-                        item.rgba = resized;
                         item.w = dst_w;
                         item.h = dst_h;
                         item.area = dst_w as u64 * dst_h as u64;
@@ -1493,10 +1643,11 @@ pub fn atlas_cmd(
                     );
 
                 let order = order_area(&mip_items);
-                let level_pad = target_side
+                let explicit_side = explicit_sides.as_ref().map(|sides| sides[level_idx - 1]);
+                let level_pad = explicit_side
                     .map(|side| scale_padding(pad, best_side, side))
                     .unwrap_or(pad);
-                let side = target_side
+                let side = explicit_side
                     .unwrap_or_else(|| find_min_side(&order, &mip_items, max_side, level_pad));
                 let (placements, remaining) = pack_shelf(&order, &mip_items, side, level_pad);
                 if !remaining.is_empty() || placements.len() != mip_items.len() {
@@ -1507,30 +1658,53 @@ pub fn atlas_cmd(
                     .into());
                 }
 
-                let level = blit_atlas(side, level_pad, &placements, &mip_items);
+                let level = if pixel_format.is_16_bit() {
+                    AtlasPixels::U16(blit_atlas16(side, level_pad, &placements, &mip_items))
+                } else {
+                    AtlasPixels::U8(blit_atlas(side, level_pad, &placements, &mip_items))
+                };
                 let meta = make_meta(level_pad, &placements, &mip_items, minecraft_pack.as_ref())?;
                 let out_path = output_path_for_mip(&chunk_out_path, level_idx);
+                let (level_width, level_height) = match &level {
+                    AtlasPixels::U8(image) => image.dimensions(),
+                    AtlasPixels::U16(image) => image.dimensions(),
+                };
                 if verbose {
                     println!(
-                        "[vrawtex] atlas: encoding chunk {} mip{} ({}x{}) -> {} (lanczos_radius=100%, taps={}, ops={}, build={:.9} sec)",
+                        "[vrawtex] atlas: encoding chunk {} mip{} ({}x{}) -> {} (lanczos_radius={}%, taps={}, ops={}, build={:.9} sec)",
                         chunk_idx,
                         level_idx,
-                        level.width(),
-                        level.height(),
+                        level_width,
+                        level_height,
                         out_path.display(),
+                        lanczos::MIPCHAIN_LANCZOS_RADIUS_PERCENT,
                         taps,
                         ops,
                         t_mip.elapsed().as_secs_f64()
                     );
                 }
-                crate::encode_rgba8_with_meta_to_file(
-                    &level,
-                    Some(&meta),
-                    &out_path,
-                    pixel_format,
-                    profile,
-                    verbose,
-                )?;
+                match level {
+                    AtlasPixels::U8(image) => crate::encode_rgba8_with_meta_to_file(
+                        &image,
+                        Some(&meta),
+                        &out_path,
+                        pixel_format,
+                        profile,
+                        verbose,
+                    )?,
+                    AtlasPixels::U16(image) => {
+                        let encoded = crate::u16_codec::encode_rgba16_with_meta_to_vec(
+                            &image,
+                            Some(&meta),
+                            pixel_format,
+                            profile,
+                            verbose,
+                            None,
+                            std::time::Instant::now(),
+                        )?;
+                        std::fs::write(&out_path, encoded)?;
+                    }
+                }
                 previous_side = side;
                 level_idx += 1;
             }
@@ -1635,6 +1809,51 @@ mod tests {
     }
 
     #[test]
+    fn atlas_mipchain_writes_rgba16_levels() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vrawtex-atlas16-mips-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("precise.png");
+        let source = crate::Rgba16Image::from_fn(8, 4, |x, y| {
+            Rgba([
+                (x * 257 + y) as u16,
+                0x1234 + x as u16,
+                0xff00 + y as u16,
+                0x8000 + x as u16 + y as u16,
+            ])
+        });
+        image::DynamicImage::ImageRgba16(source)
+            .save(&input)
+            .unwrap();
+        let output = root.join("atlas.vrawtex");
+        atlas_cmd(
+            vec![input],
+            Some(output.clone()),
+            Some(64),
+            Some(1),
+            crate::mipchain::MipChainSpec::from_cli(Some(0), Vec::new()).unwrap(),
+            crate::EncodePixelFormat::Rgba16,
+            crate::CompressionProfile::Fast,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for level in 0..=3 {
+            let bytes = fs::read(output_path_for_mip(&output, level)).unwrap();
+            let parsed = crate::parse_container(&bytes, crate::DecodeSafety::Strict).unwrap();
+            assert_eq!(parsed.pixfmt_bits, 0x0002);
+            assert_eq!(parsed.chans, 4);
+            assert!(decode_meta(parsed.meta_raw.as_deref().unwrap()).is_ok());
+        }
+        assert!(!output_path_for_mip(&output, 4).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn atlas_explicit_mip_sizes_are_exact() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1676,6 +1895,65 @@ mod tests {
     }
 
     #[test]
+    fn rgba16_atlas_preserves_low_sample_bits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vrawtex-atlas16-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("precise.png");
+        let source = crate::Rgba16Image::from_fn(3, 2, |x, y| {
+            Rgba([
+                (x * 257 + y) as u16,
+                (0x100 + x + y * 13) as u16,
+                (0xff00 + x * 3 + y) as u16,
+                if x == 0 { 0 } else { 0x1234 + y as u16 },
+            ])
+        });
+        image::DynamicImage::ImageRgba16(source.clone())
+            .save(&input)
+            .unwrap();
+        let output = root.join("atlas.vrawtex");
+        atlas_cmd(
+            vec![input],
+            Some(output.clone()),
+            Some(32),
+            Some(1),
+            None,
+            crate::EncodePixelFormat::Rgba16,
+            crate::CompressionProfile::Fast,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let bytes = fs::read(output).unwrap();
+        let parsed = crate::parse_container(&bytes, crate::DecodeSafety::Strict).unwrap();
+        let meta = decode_meta(parsed.meta_raw.as_deref().unwrap()).unwrap();
+        let (x, y, w, h) = unpack_rect_u64(meta.1[0].1);
+        assert_eq!((w, h), (3, 2));
+        let (planes, _, _, _) = crate::u16_codec::decode_container_to_planes_u16(
+            &parsed,
+            &bytes,
+            crate::DecodeSafety::Strict,
+            true,
+        )
+        .unwrap();
+        for source_y in 0..2usize {
+            for source_x in 0..3usize {
+                let atlas_index =
+                    (y as usize + source_y) * parsed.width as usize + x as usize + source_x;
+                let expected = source.get_pixel(source_x as u32, source_y as u32).0;
+                for channel in 0..4 {
+                    assert_eq!(planes[channel][atlas_index], expected[channel]);
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn minecraft_atlas_preserves_resource_locations_and_mcmeta() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1694,9 +1972,11 @@ mod tests {
             .unwrap();
 
         let texture = texture_dir.join("animated.png");
-        RgbaImage::from_pixel(4, 8, Rgba([10, 20, 30, 255]))
-            .save(&texture)
-            .unwrap();
+        let base_texture = RgbaImage::from_fn(4, 8, |x, y| {
+            let alpha = [0, 17, 64, 127, 128, 191, 254, 255][y as usize];
+            Rgba([(220 + x * 7) as u8, (80 + y * 9) as u8, 160, alpha])
+        });
+        base_texture.save(&texture).unwrap();
         fs::write(
             texture_dir.join("animated.png.mcmeta"),
             r#"{"animation":{"frametime":2}}"#,
@@ -1780,6 +2060,81 @@ mod tests {
             .unwrap();
         assert_eq!((base.source_width, base.source_height), (4, 8));
         assert!(base.mcmeta.as_deref().unwrap().contains("\"animation\""));
+
+        let (planes, _, _, _) = crate::decode_container_to_planes(
+            &parsed,
+            &bytes[atlas_start..atlas_end],
+            crate::DecodeSafety::Strict,
+            true,
+        )
+        .unwrap();
+        let atlas_width = parsed.width as usize;
+        for y in 0..base.h as usize {
+            for x in 0..base.w as usize {
+                let atlas_index = (base.y as usize + y) * atlas_width + base.x as usize + x;
+                let expected = base_texture.get_pixel(x as u32, y as u32).0;
+                for channel in 0..4 {
+                    assert_eq!(
+                        planes[channel][atlas_index], expected[channel],
+                        "fire alpha path mismatch at ({x}, {y}) channel {channel}"
+                    );
+                }
+            }
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn minecraft_vtp_normalizes_non_native_icon_to_vrawtex() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vrawtex-minecraft-icon-test-{unique}"));
+        let texture_dir = root.join("assets/example/textures/block");
+        fs::create_dir_all(&texture_dir).unwrap();
+        fs::write(
+            root.join("pack.mcmeta"),
+            r#"{"pack":{"description":"test","pack_format":1}}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([20, 40, 60, 255]))
+            .save(texture_dir.join("stone.png"))
+            .unwrap();
+        let icon_path = root.join("icon.jpg");
+        image::RgbImage::from_pixel(3, 2, image::Rgb([100, 120, 140]))
+            .save(&icon_path)
+            .unwrap();
+
+        let out = root.join("pack.vtp");
+        atlas_cmd(
+            vec![root.clone()],
+            Some(out.clone()),
+            Some(64),
+            Some(1),
+            None,
+            crate::EncodePixelFormat::Rgba8,
+            crate::CompressionProfile::Fast,
+            Some(MinecraftPackOptions {
+                name: Some("Icon fixture".to_owned()),
+                description: None,
+                icon: Some(icon_path),
+            }),
+            false,
+        )
+        .unwrap();
+
+        let bytes = fs::read(out).unwrap();
+        let header = decode_texture_pack_header(&bytes).unwrap();
+        let icon = header.icon.unwrap();
+        assert_eq!(icon.format, "vrawtex");
+        let start = icon.offset as usize;
+        let end = start + icon.len as usize;
+        let parsed =
+            crate::parse_container(&bytes[start..end], crate::DecodeSafety::Strict).unwrap();
+        assert_eq!((parsed.width, parsed.height), (3, 2));
+        assert_eq!(parsed.chans, 4);
 
         fs::remove_dir_all(root).unwrap();
     }

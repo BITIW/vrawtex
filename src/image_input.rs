@@ -1,4 +1,4 @@
-use image::{ImageFormat, RgbaImage};
+use image::{AnimationDecoder, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use rawloader::{RawImage, RawImageData};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -7,8 +7,8 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Copy, Clone)]
@@ -155,16 +155,698 @@ pub(crate) fn is_supported_input_ext(path: &Path) -> bool {
         .to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "tif" | "tiff" | "gif" | "dng"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "bmp"
+            | "tga"
+            | "tif"
+            | "tiff"
+            | "gif"
+            | "webp"
+            | "jxl"
+            | "jxl_animated"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "dng"
     )
 }
 
+#[derive(Clone)]
+pub(crate) struct AnimationInputFrame {
+    pub image: RgbaImage,
+    pub delay_num_ms: u32,
+    pub delay_den_ms: u32,
+}
+
+pub(crate) struct LoadedAnimation {
+    pub frames: Vec<AnimationInputFrame>,
+    pub loop_count: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct AnimationInputFrame16 {
+    pub image: ImageBuffer<Rgba<u16>, Vec<u16>>,
+    pub delay_num_ms: u32,
+    pub delay_den_ms: u32,
+}
+
+pub(crate) struct LoadedAnimation16 {
+    pub frames: Vec<AnimationInputFrame16>,
+    pub loop_count: u32,
+}
+
+pub(crate) enum StreamAnimationPixels {
+    U8(RgbaImage),
+    U16(ImageBuffer<Rgba<u16>, Vec<u16>>),
+}
+
+pub(crate) struct StreamAnimationFrame {
+    pub pixels: StreamAnimationPixels,
+    pub delay_num_ms: u32,
+    pub delay_den_ms: u32,
+}
+
+pub(crate) trait AnimationFrameReader {
+    fn dimensions(&self) -> (u32, u32);
+    fn loop_count(&self) -> u32;
+    fn frame_count_hint(&self) -> Option<usize>;
+    fn next_frame(&mut self) -> Result<Option<StreamAnimationFrame>, Box<dyn Error>>;
+}
+
+pub(crate) fn is_streamed_animation_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp4" | "m4v" | "mov" | "jxl" | "jxl_animated"
+            )
+        })
+}
+
+pub(crate) fn open_streamed_animation(
+    path: &Path,
+    sixteen_bit: bool,
+) -> Result<Option<Box<dyn AnimationFrameReader>>, Box<dyn Error>> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "jxl" | "jxl_animated" => JxlAnimationReader::open(path, sixteen_bit)
+            .map(|reader| reader.map(|reader| Box::new(reader) as Box<dyn AnimationFrameReader>)),
+        "mp4" | "m4v" | "mov" => FfmpegAnimationReader::open(path, sixteen_bit)
+            .map(|reader| Some(Box::new(reader) as Box<dyn AnimationFrameReader>)),
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn load_animation(path: &Path) -> Result<Option<LoadedAnimation>, Box<dyn Error>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let animation = match extension.as_str() {
+        "gif" => load_gif_animation(path)?,
+        "webp" => load_webp_animation(path)?,
+        "mp4" | "m4v" | "mov" | "jxl" | "jxl_animated" => return Ok(None),
+        _ => return Ok(None),
+    };
+    Ok((animation.frames.len() > 1).then_some(animation))
+}
+
+pub(crate) fn load_animation16(path: &Path) -> Result<Option<LoadedAnimation16>, Box<dyn Error>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let animation = match extension.as_str() {
+        "mp4" | "m4v" | "mov" | "jxl" | "jxl_animated" => return Ok(None),
+        "gif" | "webp" => {
+            let source = if extension == "gif" {
+                load_gif_animation(path)?
+            } else {
+                load_webp_animation(path)?
+            };
+            LoadedAnimation16 {
+                frames: source
+                    .frames
+                    .into_iter()
+                    .map(|frame| AnimationInputFrame16 {
+                        image: ImageBuffer::from_raw(
+                            frame.image.width(),
+                            frame.image.height(),
+                            frame
+                                .image
+                                .into_raw()
+                                .into_iter()
+                                .map(|sample| sample as u16 * 257)
+                                .collect(),
+                        )
+                        .expect("promoted animation dimensions"),
+                        delay_num_ms: frame.delay_num_ms,
+                        delay_den_ms: frame.delay_den_ms,
+                    })
+                    .collect(),
+                loop_count: source.loop_count,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok((animation.frames.len() > 1).then_some(animation))
+}
+
+fn frames_from_image_decoder(frames: image::Frames<'_>) -> Result<LoadedAnimation, Box<dyn Error>> {
+    let frames = frames
+        .collect_frames()?
+        .into_iter()
+        .map(|frame| {
+            let (delay_num_ms, delay_den_ms) = frame.delay().numer_denom_ms();
+            AnimationInputFrame {
+                image: frame.into_buffer(),
+                delay_num_ms,
+                delay_den_ms: delay_den_ms.max(1),
+            }
+        })
+        .collect();
+    Ok(LoadedAnimation {
+        frames,
+        loop_count: 0,
+    })
+}
+
+fn load_gif_animation(path: &Path) -> Result<LoadedAnimation, Box<dyn Error>> {
+    let file = BufReader::new(File::open(path)?);
+    let decoder = image::codecs::gif::GifDecoder::new(file)?;
+    frames_from_image_decoder(decoder.into_frames())
+}
+
+fn load_webp_animation(path: &Path) -> Result<LoadedAnimation, Box<dyn Error>> {
+    let file = BufReader::new(File::open(path)?);
+    let decoder = image::codecs::webp::WebPDecoder::new(file)?;
+    frames_from_image_decoder(decoder.into_frames())
+}
+
+fn parse_frame_rate(value: &str) -> (u32, u32) {
+    let mut parts = value.split('/');
+    let numerator = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(25)
+        .max(1);
+    let denominator = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    (1000u32.saturating_mul(denominator), numerator)
+}
+
+fn seconds_to_millisecond_ratio(value: &str) -> Option<(u32, u32)> {
+    let seconds = value.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let micros = (seconds * 1_000_000.0).round().clamp(1.0, u32::MAX as f64) as u32;
+    Some((micros, 1000))
+}
+
+fn reduce_ratio_to_u32(mut numerator: u64, mut denominator: u64) -> (u32, u32) {
+    denominator = denominator.max(1);
+    let mut a = numerator;
+    let mut b = denominator;
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    let gcd = a.max(1);
+    numerator /= gcd;
+    denominator /= gcd;
+    while numerator > u32::MAX as u64 || denominator > u32::MAX as u64 {
+        numerator = numerator.div_ceil(2);
+        denominator = denominator.div_ceil(2).max(1);
+    }
+    (numerator.max(1) as u32, denominator as u32)
+}
+
+fn rgba8_from_stream(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    channels: usize,
+) -> Result<RgbaImage, Box<dyn Error>> {
+    if !(1..=4).contains(&channels) {
+        return Err(format!("unsupported JXL channel count: {channels}").into());
+    }
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for pixel in source.chunks_exact(channels) {
+        match channels {
+            1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], u8::MAX]),
+            2 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
+            3 => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]),
+            4 => rgba.extend_from_slice(&pixel[..4]),
+            _ => unreachable!(),
+        }
+    }
+    RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "failed to construct native JXL RGBA8 frame".into())
+}
+
+fn rgba16_from_stream(
+    source: &[u16],
+    width: u32,
+    height: u32,
+    channels: usize,
+) -> Result<ImageBuffer<Rgba<u16>, Vec<u16>>, Box<dyn Error>> {
+    if !(1..=4).contains(&channels) {
+        return Err(format!("unsupported JXL channel count: {channels}").into());
+    }
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for pixel in source.chunks_exact(channels) {
+        match channels {
+            1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], u16::MAX]),
+            2 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
+            3 => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u16::MAX]),
+            4 => rgba.extend_from_slice(&pixel[..4]),
+            _ => unreachable!(),
+        }
+    }
+    ImageBuffer::from_raw(width, height, rgba)
+        .ok_or_else(|| "failed to construct native JXL RGBA16 frame".into())
+}
+
+struct JxlAnimationReader {
+    image: jxl_oxide::JxlImage,
+    index: usize,
+    sixteen_bit: bool,
+    width: u32,
+    height: u32,
+    loop_count: u32,
+    ticks_numerator: u32,
+    ticks_denominator: u32,
+    frame_count: usize,
+}
+
+impl JxlAnimationReader {
+    fn open(path: &Path, sixteen_bit: bool) -> Result<Option<Self>, Box<dyn Error>> {
+        let image = jxl_oxide::JxlImage::builder().open(path).map_err(|error| {
+            format!("native JXL decoder failed for {}: {error}", path.display())
+        })?;
+        let frame_count = image.num_loaded_keyframes();
+        if frame_count <= 1 {
+            return Ok(None);
+        }
+        let animation = image
+            .image_header()
+            .metadata
+            .animation
+            .as_ref()
+            .ok_or("JXL has multiple frames but no animation timing header")?;
+        Ok(Some(Self {
+            width: image.width(),
+            height: image.height(),
+            loop_count: animation.num_loops,
+            ticks_numerator: animation.tps_numerator.max(1),
+            ticks_denominator: animation.tps_denominator.max(1),
+            image,
+            index: 0,
+            sixteen_bit,
+            frame_count,
+        }))
+    }
+}
+
+impl AnimationFrameReader for JxlAnimationReader {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn loop_count(&self) -> u32 {
+        self.loop_count
+    }
+
+    fn frame_count_hint(&self) -> Option<usize> {
+        Some(self.frame_count)
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StreamAnimationFrame>, Box<dyn Error>> {
+        if self.index >= self.frame_count {
+            return Ok(None);
+        }
+        let render = self
+            .image
+            .render_frame(self.index)
+            .map_err(|error| format!("native JXL frame {} failed: {error}", self.index))?;
+        let duration = render.duration().max(1) as u64;
+        let (delay_num_ms, delay_den_ms) = reduce_ratio_to_u32(
+            duration * self.ticks_denominator as u64 * 1000,
+            self.ticks_numerator as u64,
+        );
+        let mut stream = render.stream();
+        let width = stream.width();
+        let height = stream.height();
+        let channels = stream.channels() as usize;
+        if (width, height) != (self.width, self.height) {
+            return Err("JXL animation frame dimensions changed".into());
+        }
+        let sample_count = width as usize * height as usize * channels;
+        let pixels = if self.sixteen_bit {
+            let mut source = vec![0u16; sample_count];
+            stream.write_to_buffer(&mut source);
+            StreamAnimationPixels::U16(rgba16_from_stream(&source, width, height, channels)?)
+        } else {
+            let mut source = vec![0u8; sample_count];
+            stream.write_to_buffer(&mut source);
+            StreamAnimationPixels::U8(rgba8_from_stream(&source, width, height, channels)?)
+        };
+        self.index += 1;
+        Ok(Some(StreamAnimationFrame {
+            pixels,
+            delay_num_ms,
+            delay_den_ms,
+        }))
+    }
+}
+
+fn load_jxl_rgba8(path: &Path) -> Result<RgbaImage, Box<dyn Error>> {
+    let image = jxl_oxide::JxlImage::builder()
+        .open(path)
+        .map_err(|error| format!("native JXL decoder failed for {}: {error}", path.display()))?;
+    let render = image
+        .render_frame(0)
+        .map_err(|error| format!("native JXL frame failed: {error}"))?;
+    let mut stream = render.stream();
+    let (width, height, channels) = (stream.width(), stream.height(), stream.channels() as usize);
+    let mut samples = vec![0u8; width as usize * height as usize * channels];
+    stream.write_to_buffer(&mut samples);
+    rgba8_from_stream(&samples, width, height, channels)
+}
+
+fn load_jxl_rgba16(path: &Path) -> Result<ImageBuffer<Rgba<u16>, Vec<u16>>, Box<dyn Error>> {
+    let image = jxl_oxide::JxlImage::builder()
+        .open(path)
+        .map_err(|error| format!("native JXL decoder failed for {}: {error}", path.display()))?;
+    let render = image
+        .render_frame(0)
+        .map_err(|error| format!("native JXL frame failed: {error}"))?;
+    let mut stream = render.stream();
+    let (width, height, channels) = (stream.width(), stream.height(), stream.channels() as usize);
+    let mut samples = vec![0u16; width as usize * height as usize * channels];
+    stream.write_to_buffer(&mut samples);
+    rgba16_from_stream(&samples, width, height, channels)
+}
+
+struct FfmpegAnimationInfo {
+    width: u32,
+    height: u32,
+    default_delay: (u32, u32),
+    delays: Vec<(u32, u32)>,
+    normalization_filter: Option<String>,
+}
+
+fn optional_video_backend(name: &str, environment: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(environment) {
+        return PathBuf::from(path);
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let filename = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        };
+        let sibling = directory.join(filename);
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn probe_ffmpeg_animation(path: &Path) -> Result<FfmpegAnimationInfo, Box<dyn Error>> {
+    let probe = Command::new(optional_video_backend("ffprobe", "VRAWTEX_FFPROBE"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,color_space,color_transfer,color_primaries:frame=duration_time,pkt_duration_time",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "MP4/MOV decoding uses the optional `ffprobe`/`ffmpeg` backend; could not run `ffprobe`: {error}"
+            )
+        })?;
+    if !probe.status.success() {
+        return Err(format!(
+            "ffprobe failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&probe.stderr).trim()
+        )
+        .into());
+    }
+    let json: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
+    let stream = json
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| streams.first())
+        .ok_or("ffprobe returned no video stream")?;
+    let width = stream
+        .get("width")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("ffprobe returned invalid video width")?;
+    let height = stream
+        .get("height")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("ffprobe returned invalid video height")?;
+    let default_delay = parse_frame_rate(
+        stream
+            .get("avg_frame_rate")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("25/1"),
+    );
+    let delays = json
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .map(|frame| {
+                    frame
+                        .get("duration_time")
+                        .or_else(|| frame.get("pkt_duration_time"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(seconds_to_millisecond_ratio)
+                        .unwrap_or(default_delay)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let color_primaries = stream
+        .get("color_primaries")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let color_space = stream
+        .get("color_space")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let color_transfer = stream
+        .get("color_transfer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let normalization_filter = matches!(color_primaries, "reserved" | "unknown" | "")
+        .then(|| match color_space {
+            "bt2020nc" | "bt2020c" => "bt2020",
+            _ => "bt709",
+        })
+        .map(|primaries| {
+            let transfer = if color_transfer.is_empty() {
+                "bt709"
+            } else {
+                color_transfer
+            };
+            let space = if color_space.is_empty() {
+                "bt709"
+            } else {
+                color_space
+            };
+            format!("setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={space}")
+        });
+    Ok(FfmpegAnimationInfo {
+        width,
+        height,
+        default_delay,
+        delays,
+        normalization_filter,
+    })
+}
+
+struct FfmpegAnimationReader {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    info: FfmpegAnimationInfo,
+    index: usize,
+    frame_bytes: usize,
+    sixteen_bit: bool,
+    finished: bool,
+}
+
+impl FfmpegAnimationReader {
+    fn open(path: &Path, sixteen_bit: bool) -> Result<Self, Box<dyn Error>> {
+        let info = probe_ffmpeg_animation(path)?;
+        let sample_bytes = if sixteen_bit { 2 } else { 1 };
+        let frame_bytes = (info.width as usize)
+            .checked_mul(info.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4 * sample_bytes))
+            .ok_or("video animation frame size overflow")?;
+        let mut command = Command::new(optional_video_backend("ffmpeg", "VRAWTEX_FFMPEG"));
+        command
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0"]);
+        if let Some(filter) = info.normalization_filter.as_deref() {
+            command.args(["-vf", filter]);
+        }
+        command.args([
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            if sixteen_bit { "rgba64le" } else { "rgba" },
+            "pipe:1",
+        ]);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "MP4/MOV decoding uses the optional `ffmpeg` backend; could not run `ffmpeg`: {error}"
+                )
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("ffmpeg stdout pipe unavailable")?;
+        Ok(Self {
+            child,
+            stdout: BufReader::new(stdout),
+            info,
+            index: 0,
+            frame_bytes,
+            sixteen_bit,
+            finished: false,
+        })
+    }
+
+    fn finish(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            pipe.read_to_string(&mut stderr)?;
+        }
+        let status = self.child.wait()?;
+        if !status.success() {
+            return Err(format!("ffmpeg video decode failed: {}", stderr.trim()).into());
+        }
+        Ok(())
+    }
+}
+
+impl AnimationFrameReader for FfmpegAnimationReader {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.info.width, self.info.height)
+    }
+
+    fn loop_count(&self) -> u32 {
+        0
+    }
+
+    fn frame_count_hint(&self) -> Option<usize> {
+        (!self.info.delays.is_empty()).then_some(self.info.delays.len())
+    }
+
+    fn next_frame(&mut self) -> Result<Option<StreamAnimationFrame>, Box<dyn Error>> {
+        let mut bytes = vec![0u8; self.frame_bytes];
+        let first = self.stdout.read(&mut bytes[..1])?;
+        if first == 0 {
+            self.finish()?;
+            return Ok(None);
+        }
+        self.stdout
+            .read_exact(&mut bytes[1..])
+            .map_err(|error| format!("ffmpeg returned a truncated video frame: {error}"))?;
+        let (delay_num_ms, delay_den_ms) = self
+            .info
+            .delays
+            .get(self.index)
+            .copied()
+            .unwrap_or(self.info.default_delay);
+        self.index += 1;
+        let pixels = if self.sixteen_bit {
+            let samples = bytes
+                .chunks_exact(2)
+                .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+                .collect();
+            StreamAnimationPixels::U16(
+                ImageBuffer::from_raw(self.info.width, self.info.height, samples)
+                    .ok_or("failed to construct streamed RGBA16 video frame")?,
+            )
+        } else {
+            StreamAnimationPixels::U8(
+                RgbaImage::from_raw(self.info.width, self.info.height, bytes)
+                    .ok_or("failed to construct streamed RGBA8 video frame")?,
+            )
+        };
+        Ok(Some(StreamAnimationFrame {
+            pixels,
+            delay_num_ms,
+            delay_den_ms,
+        }))
+    }
+}
+
+impl Drop for FfmpegAnimationReader {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 pub(crate) fn load_rgba8(path: &Path) -> Result<RgbaImage, Box<dyn Error>> {
-    if is_dng_ext(path) {
+    if is_jxl_ext(path) {
+        load_jxl_rgba8(path)
+    } else if is_dng_ext(path) {
         load_dng_rgba8(path)
     } else {
         Ok(load_image_no_limits(path)?.to_rgba8())
     }
+}
+
+pub(crate) fn load_rgba16(path: &Path) -> Result<ImageBuffer<Rgba<u16>, Vec<u16>>, Box<dyn Error>> {
+    if is_jxl_ext(path) {
+        return load_jxl_rgba16(path);
+    }
+    if is_dng_ext(path) {
+        let rgba8 = load_dng_rgba8(path)?;
+        return Ok(ImageBuffer::from_fn(
+            rgba8.width(),
+            rgba8.height(),
+            |x, y| {
+                let pixel = rgba8.get_pixel(x, y).0;
+                Rgba(pixel.map(|sample| sample as u16 * 257))
+            },
+        ));
+    }
+    Ok(load_image_no_limits(path)?.to_rgba16())
+}
+
+fn is_jxl_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("jxl") || extension.eq_ignore_ascii_case("jxl_animated")
+        })
 }
 
 fn is_dng_ext(path: &Path) -> bool {
